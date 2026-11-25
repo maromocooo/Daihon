@@ -99,10 +99,17 @@ pub trait AgentRunner {
 
 pub fn build_runner(kind: AgentKind, config: &HarnessConfig) -> Result<Box<dyn AgentRunner>> {
     let binary = config.binary_for(kind);
+    let extra_args = config.extra_args_for(kind);
     match kind {
-        AgentKind::Agy => Ok(Box::new(AgyRunner::new(binary))),
-        AgentKind::Codex => Ok(Box::new(CodexRunner::new(binary))),
-        AgentKind::Claude => Ok(Box::new(ClaudeRunner::new(binary))),
+        AgentKind::Agy => Ok(Box::new(
+            AgyRunner::new(binary).with_extra_args(extra_args),
+        )),
+        AgentKind::Codex => Ok(Box::new(
+            CodexRunner::new(binary).with_extra_args(extra_args),
+        )),
+        AgentKind::Claude => Ok(Box::new(
+            ClaudeRunner::new(binary).with_extra_args(extra_args),
+        )),
         AgentKind::Mock => bail!(
             "CLI から直接 `mock` ランナーは実行できません（自動テスト専用です。agy / codex / claude を指定してください）"
         ),

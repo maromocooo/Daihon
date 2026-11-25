@@ -8,13 +8,20 @@ use crate::runner::{AgentRequest, AgentResponse, AgentRunner, ExecutionMode, ext
 #[derive(Debug, Clone)]
 pub struct AgyRunner {
     binary: String,
+    extra_args: Vec<String>,
 }
 
 impl AgyRunner {
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            extra_args: Vec::new(),
         }
+    }
+
+    pub fn with_extra_args(mut self, extra_args: Vec<String>) -> Self {
+        self.extra_args = extra_args;
+        self
     }
 
     pub fn build_args(&self, req: &AgentRequest, schema_path: Option<&str>) -> Vec<String> {
@@ -53,6 +60,8 @@ impl AgyRunner {
             args.push("--json-schema".to_string());
             args.push(path.to_string());
         }
+
+        args.extend(self.extra_args.iter().cloned());
 
         // Attach prompt directly to `--print=<prompt>` so agy never misinterprets
         // subsequent flags or leading dashes as the prompt value.

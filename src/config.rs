@@ -46,6 +46,8 @@ pub struct AgentsConfig {
     pub allow_same_agent: bool,
     /// Optional executable overrides (e.g. `{ claude = "/usr/local/bin/claude" }`).
     pub binaries: BTreeMap<String, String>,
+    /// Optional extra CLI flags per agent (e.g. `{ claude = ["--model", "opus", "--effort", "high"] }`).
+    pub extra_args: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for AgentsConfig {
@@ -56,6 +58,7 @@ impl Default for AgentsConfig {
             watcher: AgentKind::Codex,
             allow_same_agent: false,
             binaries: BTreeMap::new(),
+            extra_args: BTreeMap::new(),
         }
     }
 }
@@ -198,6 +201,14 @@ impl HarnessConfig {
             .unwrap_or_else(|| kind.default_binary().to_string())
     }
 
+    pub fn extra_args_for(&self, kind: AgentKind) -> Vec<String> {
+        self.agents
+            .extra_args
+            .get(&kind.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn sample_toml() -> String {
         r#"# シナリオ駆動の開発ハーネス設定ファイル
 scenarios_dir = "scenarios"
@@ -210,6 +221,11 @@ register = "agy"
 developer = "agy"
 watcher = "codex"
 allow_same_agent = false
+
+[agents.extra_args]
+# エージェント別の追加 CLI 引数（任意: モデルや推論強度の指定など）
+# claude = ["--model", "opus", "--effort", "high"]
+# codex = ["-m", "gpt-5-codex"]
 
 [watcher]
 timeout_secs = 300

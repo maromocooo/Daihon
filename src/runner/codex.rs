@@ -9,13 +9,20 @@ use crate::runner::{AgentRequest, AgentResponse, AgentRunner, ExecutionMode, ext
 #[derive(Debug, Clone)]
 pub struct CodexRunner {
     binary: String,
+    extra_args: Vec<String>,
 }
 
 impl CodexRunner {
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            extra_args: Vec::new(),
         }
+    }
+
+    pub fn with_extra_args(mut self, extra_args: Vec<String>) -> Self {
+        self.extra_args = extra_args;
+        self
     }
 
     pub fn build_args(
@@ -31,24 +38,32 @@ impl CodexRunner {
                 "workspace-write".to_string()
             }
         };
+        let has_sandbox_override = self.extra_args.iter().any(|a| {
+            a == "-s" || a == "--sandbox" || a.starts_with("--sandbox=")
+        });
 
         let mut args = vec![
             "exec".to_string(),
             "-C".to_string(),
             req.working_dir.to_string_lossy().to_string(),
-            "-s".to_string(),
-            sandbox,
+        ];
+        if !has_sandbox_override {
+            args.push("-s".to_string());
+            args.push(sandbox);
+        }
+        args.extend([
             "--ephemeral".to_string(),
             "--skip-git-repo-check".to_string(),
             "-o".to_string(),
             output_path.to_string(),
-        ];
+        ]);
 
         if let Some(path) = schema_path {
             args.push("--output-schema".to_string());
             args.push(path.to_string());
         }
 
+        args.extend(self.extra_args.iter().cloned());
         args.push("-".to_string());
         args
     }

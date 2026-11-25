@@ -8,13 +8,20 @@ use crate::runner::{AgentRequest, AgentResponse, AgentRunner, ExecutionMode, ext
 #[derive(Debug, Clone)]
 pub struct ClaudeRunner {
     binary: String,
+    extra_args: Vec<String>,
 }
 
 impl ClaudeRunner {
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            extra_args: Vec::new(),
         }
+    }
+
+    pub fn with_extra_args(mut self, extra_args: Vec<String>) -> Self {
+        self.extra_args = extra_args;
+        self
     }
 
     pub fn build_args(&self, req: &AgentRequest) -> Result<Vec<String>> {
@@ -23,11 +30,18 @@ impl ClaudeRunner {
             ExecutionMode::Verify => "default",
             ExecutionMode::WorkspaceWrite => "acceptEdits",
         };
-        let mut args = vec![
-            "-p".to_string(),
-            "--permission-mode".to_string(),
-            perm.to_string(),
-        ];
+        let has_perm_override = self.extra_args.iter().any(|a| {
+            a == "--permission-mode"
+                || a.starts_with("--permission-mode=")
+                || a == "--dangerously-skip-permissions"
+        });
+
+        let mut args = vec!["-p".to_string()];
+        if !has_perm_override {
+            args.push("--permission-mode".to_string());
+            args.push(perm.to_string());
+        }
+        args.extend(self.extra_args.iter().cloned());
 
         if let Some(ref schema) = req.json_schema {
             args.push("--output-format".to_string());

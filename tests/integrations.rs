@@ -229,3 +229,96 @@ fn runner_adapters_build_expected_cli_flags_and_unwrap_envelopes() {
     let str_structured_env = r#"{"structured_output":"{\"id\":\"demo3\"}"}"#;
     assert_eq!(extract_json_value(str_structured_env).unwrap()["id"], "demo3");
 }
+
+#[test]
+fn config_extra_args_propagate_to_claude_codex_and_agy_runners_safely() {
+    use daihon::config::HarnessConfig;
+    use daihon::runner::AgentKind;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join(".daihon.toml"),
+        r#"
+[agents]
+developer = "claude"
+watcher = "codex"
+
+[agents.extra_args]
+claude = ["--model", "opus", "--effort", "high"]
+codex = ["-m", "gpt-5-codex"]
+agy = ["--model", "pro"]
+"#,
+    )
+    .unwrap();
+
+    let cfg = HarnessConfig::load_from_dir(dir.path()).unwrap();
+    assert_eq!(
+        cfg.extra_args_for(AgentKind::Claude),
+        vec!["--model", "opus", "--effort", "high"]
+    );
+    assert_eq!(
+        cfg.extra_args_for(AgentKind::Codex),
+        vec!["-m", "gpt-5-codex"]
+    );
+    assert_eq!(cfg.extra_args_for(AgentKind::Agy), vec!["--model", "pro"]);
+
+    let req = AgentRequest {
+        working_dir: PathBuf::from("/tmp/work"),
+        prompt: "implement feature".to_string(),
+        json_schema: None,
+        mode: ExecutionMode::WorkspaceWrite,
+        sandbox_override: None,
+        env_vars: BTreeMap::new(),
+        timeout_secs: 180,
+    };
+
+    // Claude: default --permission-mode acceptEdits + extra_args
+    let claude_args = ClaudeRunner::new("claude")
+        .with_extra_args(cfg.extra_args_for(AgentKind::Claude))
+        .build_args(&req)
+        .unwrap();
+    assert!(claude_args.contains(&"--permission-mode".to_string()));
+    assert!(claude_args.contains(&"acceptEdits".to_string()));
+    assert!(claude_args.contains(&"--model".to_string()));
+    assert!(claude_args.contains(&"opus".to_string()));
+    assert!(claude_args.contains(&"--effort".to_string()));
+    assert!(claude_args.contains(&"high".to_string()));
+
+    // Claude: explicit permission override in extra_args must not duplicate --permission-mode
+    let claude_override = ClaudeRunner::new("claude")
+        .with_extra_args(vec![
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ])
+        .build_args(&req)
+        .unwrap();
+    assert_eq!(
+        claude_override
+            .iter()
+            .filter(|a| a.as_str() == "--permission-mode")
+            .count(),
+        1
+    );
+    assert!(claude_override.contains(&"bypassPermissions".to_string()));
+
+    // Codex: extra_args must appear after `exec` and BEFORE trailing `-`
+    let codex_args = CodexRunner::new("codex")
+        .with_extra_args(cfg.extra_args_for(AgentKind::Codex))
+        .build_args(&req, None, "/tmp/out.txt");
+    let model_pos = codex_args.iter().position(|a| a == "-m").unwrap();
+    let dash_pos = codex_args.iter().rposition(|a| a == "-").unwrap();
+    assert!(model_pos > 0 && model_pos < dash_pos);
+
+    // Agy: extra_args must appear BEFORE `--print=<prompt>`
+    let agy_args = AgyRunner::new("agy")
+        .with_extra_args(cfg.extra_args_for(AgentKind::Agy))
+        .build_args(&req, None);
+    let agy_model_pos = agy_args.iter().position(|a| a == "--model").unwrap();
+    let print_pos = agy_args
+        .iter()
+        .position(|a| a == "--print=implement feature")
+        .unwrap();
+    assert!(agy_model_pos < print_pos);
+}
