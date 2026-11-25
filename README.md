@@ -24,9 +24,10 @@ When you delegate implementation to coding agents, they frequently drift toward 
 Daihon closes the loop:
 
 1. **Always-On alignment**: Injects your `P0` scenarios and current progress into coding agent sessions (`AGENTS.md` / `CLAUDE.md` rules + `SessionStart` hooks).
-2. **Independent watcher**: A **separate agent** (e.g., `codex` watching `claude`/`agy`) automatically tests each step in the background (`auto` checks via commands/SSH, while keeping `manual` GUI checks separate) and records exactly which step and check failed.
-3. **Drift detection & automatic handoff**: Flags `[DRIFT]` when code changes keep happening without advancing the stopped step, and keeps `.daihon/NEXT_TASK.md` up to date so agents self-correct before you have to intervene.
-4. **Signal-only phone notifications**: Sends a smartphone notification via [ntfy](https://ntfy.sh/) **only** when a scenario passes all steps—never spamming you on individual parts or partial progress.
+2. **Big E2E milestones + `Togaki` (ト書き) branches**: Start with an ambitious end-to-end milestone (e.g., *"Open app on MacBook Air and edit in Blender running on Ubuntu"*), then graft follow-up refinements or non-functional requirements onto it via `daihon togaki <parent-id> "..."` (e.g., *"Latency stays under 50ms"*, *"Transfer local Air assets into the open Blender session"*). Child `Togaki` wait automatically until the parent passes, keeping your parent scenario untouched and rendered as a clean tree in the TUI.
+3. **Independent watcher**: A **separate agent** (e.g., `codex` watching `claude`/`agy`) automatically tests each step in the background (`auto` checks via commands/SSH, while keeping `manual` GUI checks separate) and records exactly which step and check failed.
+4. **Drift detection & automatic handoff**: Flags `[DRIFT]` when code changes keep happening without advancing the stopped step, and keeps `.daihon/NEXT_TASK.md` up to date so agents self-correct before you have to intervene.
+5. **Signal-only phone notifications**: Sends a smartphone notification via [ntfy](https://ntfy.sh/) **only** when a scenario or `Togaki` passes all steps—never spamming you on individual parts or partial progress.
 
 ## Install
 
@@ -46,8 +47,12 @@ daihon init                           # Creates .daihon.toml and scenarios/
 echo '.daihon/' >> .gitignore
 daihon init-integration agy           # Or: codex / claude (merges Skill, rules & hooks safely)
 
-# 1. Register your core dogfooding scenario in natural language
-daihon register "Launch the terminal workflow and seamlessly continue development across hosts"
+# 1. Register a large E2E milestone scenario in natural language
+daihon register "Open the app on MacBook Air and edit in Blender running on Ubuntu"
+
+# 1b. Attach follow-up requirements / branches ("Togaki") without touching the parent file
+daihon togaki <parent-id> "Keep end-to-end latency under 50ms"
+daihon togaki <parent-id> "Transfer local assets from Air into the open Blender session"
 
 # 2. Verify with an independent watcher agent
 daihon watch
@@ -78,7 +83,8 @@ daihon notify test
 | `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (list, priorities, step checks, `[DRIFT]` alerts) |
 | `daihon status [--json]` | Print non-interactive scenario status summary and stopped steps |
 | `daihon context` | Output concise current-state / drift brief for coding agent sessions |
-| `daihon register "<text>"` | Turn natural language into a structured scenario with overlap & priority proposals |
+| `daihon register "<text>"` | Turn natural language into a structured E2E scenario with overlap & priority proposals |
+| `daihon togaki <parent-id> "<text>"` | Attach a follow-up requirement or branch (`Togaki`) under an existing parent scenario |
 | `daihon watch [--if-changed \| --background \| --interval 15m \| --stop \| --daemon-status]` | Run independent watcher verification or manage the background periodic daemon |
 | `daihon check <id> <check-id> --pass` | Mark `[manual]` (or any) check items as passed/failed/reset |
 | `daihon hook install` | Install a non-blocking git `post-commit` hook for background watching |

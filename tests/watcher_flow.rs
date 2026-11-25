@@ -162,6 +162,7 @@ fn watcher_stops_at_missing_feature_then_passes_all_steps_after_fix_and_reflects
         sandbox: Some("workspace-write".to_string()),
         environment: EnvironmentConfig::default(),
         drift: DriftConfig::default(),
+        parent_context: None,
         notify_topic: "test".to_string(),
         notify_on_ready_for_manual: true,
     };

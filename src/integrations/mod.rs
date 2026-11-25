@@ -18,6 +18,8 @@ const CLAUDE_CMD_WATCH: &str =
     include_str!("../../integrations/claude/.claude/commands/daihon-watch.md");
 const CLAUDE_CMD_STATUS: &str =
     include_str!("../../integrations/claude/.claude/commands/daihon-status.md");
+const CLAUDE_CMD_TOGAKI: &str =
+    include_str!("../../integrations/claude/.claude/commands/daihon-togaki.md");
 const ALWAYS_ON_RULE: &str = include_str!("../../integrations/rules/scenario-first.md");
 
 const RULE_START: &str = "<!-- daihon:start -->";
@@ -92,6 +94,7 @@ pub fn install_integration_with_options(
         IntegrationTarget::Claude => vec![
             (".claude/skills/daihon/SKILL.md", CLAUDE_SKILL),
             (".claude/commands/daihon-register.md", CLAUDE_CMD_REGISTER),
+            (".claude/commands/daihon-togaki.md", CLAUDE_CMD_TOGAKI),
             (".claude/commands/daihon-watch.md", CLAUDE_CMD_WATCH),
             (".claude/commands/daihon-status.md", CLAUDE_CMD_STATUS),
         ],

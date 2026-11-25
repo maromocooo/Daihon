@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::config::DriftConfig;
-use crate::model::store::{LoadedScenario, load_scenarios_from_dir};
+use crate::model::scenario::ScenarioStatus;
+use crate::model::store::{LoadedScenario, TreeEntry, load_scenarios_tree, order_as_tree};
 use crate::watcher::drift::{DriftSummary, analyze_scenario_drift};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,12 +14,20 @@ pub enum FocusPane {
     Detail,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ChildrenSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub pending: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub dir: PathBuf,
     pub state_dir: PathBuf,
     pub drift_cfg: DriftConfig,
-    pub scenarios: Vec<LoadedScenario>,
+    pub entries: Vec<TreeEntry>,
     pub drifts: HashMap<String, DriftSummary>,
     pub selected: usize,
     pub detail_scroll: u16,
@@ -36,13 +45,13 @@ impl App {
     }
 
     pub fn load_with_state(dir: &Path, state_dir: &Path, drift_cfg: DriftConfig) -> Result<Self> {
-        let scenarios = load_scenarios_from_dir(dir)?;
-        let drifts = load_drift_map(&scenarios, state_dir, &drift_cfg);
+        let entries = load_scenarios_tree(dir)?;
+        let drifts = load_drift_map(&entries, state_dir, &drift_cfg);
         Ok(Self {
             dir: dir.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
             drift_cfg,
-            scenarios,
+            entries,
             drifts,
             selected: 0,
             detail_scroll: 0,
@@ -59,7 +68,7 @@ impl App {
                 .join(".daihon"),
             dir,
             drift_cfg: DriftConfig::default(),
-            scenarios,
+            entries: order_as_tree(scenarios),
             drifts: HashMap::new(),
             selected: 0,
             detail_scroll: 0,
@@ -69,25 +78,25 @@ impl App {
     }
 
     pub fn reload(&mut self) {
-        match load_scenarios_from_dir(&self.dir) {
-            Ok(scenarios) => {
+        match load_scenarios_tree(&self.dir) {
+            Ok(entries) => {
                 let prev_id = self
                     .selected_scenario()
                     .map(|s| s.scenario.front_matter.id.clone());
-                self.drifts = load_drift_map(&scenarios, &self.state_dir, &self.drift_cfg);
-                self.scenarios = scenarios;
+                self.drifts = load_drift_map(&entries, &self.state_dir, &self.drift_cfg);
+                self.entries = entries;
                 if let Some(id) = prev_id
                     && let Some(pos) = self
-                        .scenarios
+                        .entries
                         .iter()
-                        .position(|s| s.scenario.front_matter.id == id)
+                        .position(|e| e.loaded.scenario.front_matter.id == id)
                 {
                     self.selected = pos;
-                } else if self.selected >= self.scenarios.len() {
-                    self.selected = self.scenarios.len().saturating_sub(1);
+                } else if self.selected >= self.entries.len() {
+                    self.selected = self.entries.len().saturating_sub(1);
                 }
                 self.detail_scroll = 0;
-                self.status_message = Some(format!("再読込完了 ({} 件)", self.scenarios.len()));
+                self.status_message = Some(format!("再読込完了 ({} 件)", self.entries.len()));
             }
             Err(err) => {
                 self.status_message = Some(format!("読込エラー: {err}"));
@@ -95,19 +104,38 @@ impl App {
         }
     }
 
+    pub fn selected_entry(&self) -> Option<&TreeEntry> {
+        self.entries.get(self.selected)
+    }
+
     pub fn selected_scenario(&self) -> Option<&LoadedScenario> {
-        self.scenarios.get(self.selected)
+        self.entries.get(self.selected).map(|e| &e.loaded)
     }
 
     pub fn drift_for(&self, scenario_id: &str) -> Option<&DriftSummary> {
         self.drifts.get(scenario_id)
     }
 
+    pub fn children_summary_for(&self, parent_id: &str) -> ChildrenSummary {
+        let mut summary = ChildrenSummary::default();
+        for entry in &self.entries {
+            if entry.loaded.scenario.front_matter.parent.as_deref() == Some(parent_id) {
+                summary.total += 1;
+                match entry.loaded.scenario.front_matter.status {
+                    ScenarioStatus::Passed | ScenarioStatus::ReadyForManual => summary.passed += 1,
+                    ScenarioStatus::Failed => summary.failed += 1,
+                    ScenarioStatus::Pending | ScenarioStatus::InProgress => summary.pending += 1,
+                }
+            }
+        }
+        summary
+    }
+
     pub fn next(&mut self) {
         match self.focus {
             FocusPane::List => {
-                if !self.scenarios.is_empty() {
-                    self.selected = (self.selected + 1) % self.scenarios.len();
+                if !self.entries.is_empty() {
+                    self.selected = (self.selected + 1) % self.entries.len();
                     self.detail_scroll = 0;
                 }
             }
@@ -120,9 +148,9 @@ impl App {
     pub fn previous(&mut self) {
         match self.focus {
             FocusPane::List => {
-                if !self.scenarios.is_empty() {
+                if !self.entries.is_empty() {
                     if self.selected == 0 {
-                        self.selected = self.scenarios.len() - 1;
+                        self.selected = self.entries.len() - 1;
                     } else {
                         self.selected -= 1;
                     }
@@ -144,13 +172,13 @@ impl App {
 }
 
 fn load_drift_map(
-    scenarios: &[LoadedScenario],
+    entries: &[TreeEntry],
     state_dir: &Path,
     drift_cfg: &DriftConfig,
 ) -> HashMap<String, DriftSummary> {
     let mut map = HashMap::new();
-    for item in scenarios {
-        let id = &item.scenario.front_matter.id;
+    for entry in entries {
+        let id = &entry.loaded.scenario.front_matter.id;
         if let Ok(Some(summary)) = analyze_scenario_drift(state_dir, id, drift_cfg) {
             map.insert(id.clone(), summary);
         }

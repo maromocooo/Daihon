@@ -45,6 +45,9 @@ tags:
 | :--- | :---: | :--- | :--- |
 | `id` | 必須 | kebab-case 文字列 (`^[a-z0-9]+(-[a-z0-9]+)*$`) | シナリオ識別子。同一ディレクトリ内で一意であること。 |
 | `title` | 必須 | 非空文字列 | 一覧や通知に表示するシナリオ名。 |
+| `kind` | 任意 | `scenario`（既定） \| `togaki` | 本筋シナリオ（`scenario`）か、親にぶら下がる枝葉・品質要件のト書き（`togaki`）か。 |
+| `parent` | 条件付き必須 | kebab-case シナリオ ID | `kind: togaki` のとき必須。同一ディレクトリ内の親シナリオ ID を指定する（循環禁止）。 |
+| `attach_step` | 任意 | 1 以上の整数 | `kind: togaki` が親シナリオの特定ステップに紐づく場合に指定。 |
 | `priority` | 必須 | `P0` \| `P1` \| `P2` \| `P3` | 優先度（`P0` が最優先）。 |
 | `status` | 必須 | `pending` \| `in_progress` \| `passed` \| `failed` \| `ready_for_manual` | シナリオ全体の状態。 |
 | `last_checked_at` | 任意 | `null` または RFC 3339 日時文字列 | 見張り役が最後に検証した日時（例: `2026-11-25T09:30:00+09:00`）。 |

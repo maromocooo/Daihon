@@ -78,6 +78,7 @@ hosts:
             stagnant_runs_threshold: 3,
             code_changes_threshold: 2,
         },
+        parent_context: None,
         notify_topic: "test".to_string(),
         notify_on_ready_for_manual: true,
     };
@@ -159,7 +160,7 @@ hosts:
             .is_none()
     );
     let next_task_clear = fs::read_to_string(state_dir.join("NEXT_TASK.md")).unwrap();
-    assert!(next_task_clear.contains("失敗中（`failed`）のシナリオはありません"));
+    assert!(next_task_clear.contains("失敗中（`failed`）のシナリオ／ト書きはありません"));
 }
 
 #[test]

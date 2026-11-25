@@ -94,6 +94,7 @@ notified_pass_at: null
         sandbox: None,
         environment: EnvironmentConfig::default(),
         drift: DriftConfig::default(),
+        parent_context: None,
         notify_topic: "my-secret-topic".to_string(),
         notify_on_ready_for_manual: true,
     };

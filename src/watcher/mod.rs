@@ -23,6 +23,31 @@ use crate::watcher::drift::{
 };
 
 #[derive(Debug, Clone)]
+pub struct ParentContext {
+    pub id: String,
+    pub title: String,
+    pub overview: String,
+    pub hosts: Vec<String>,
+    pub step_titles: Vec<(usize, String)>,
+}
+
+impl ParentContext {
+    pub fn from_scenario(sc: &Scenario) -> Self {
+        Self {
+            id: sc.front_matter.id.clone(),
+            title: sc.front_matter.title.clone(),
+            overview: sc.overview.clone(),
+            hosts: sc.front_matter.hosts.clone(),
+            step_titles: sc
+                .steps
+                .iter()
+                .map(|s| (s.number, s.title.clone()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WatchOptions {
     pub working_dir: PathBuf,
     pub state_dir: PathBuf,
@@ -30,6 +55,7 @@ pub struct WatchOptions {
     pub sandbox: Option<String>,
     pub environment: EnvironmentConfig,
     pub drift: DriftConfig,
+    pub parent_context: Option<ParentContext>,
     pub notify_topic: String,
     pub notify_on_ready_for_manual: bool,
 }
@@ -207,7 +233,12 @@ pub fn watch_scenario(
         );
         let _ = io::stdout().flush();
 
-        let prompt = build_watcher_step_prompt(&scenario, &step_snapshot, &options.environment);
+        let prompt = build_watcher_step_prompt(
+            &scenario,
+            &step_snapshot,
+            &options.environment,
+            options.parent_context.as_ref(),
+        );
         let response = watcher_runner.run(&AgentRequest {
             working_dir: options.working_dir.clone(),
             prompt,
@@ -511,6 +542,7 @@ fn build_watcher_step_prompt(
     scenario: &Scenario,
     step: &Step,
     env_cfg: &EnvironmentConfig,
+    parent_ctx: Option<&ParentContext>,
 ) -> String {
     let auto_list = step
         .checks
@@ -521,6 +553,13 @@ fn build_watcher_step_prompt(
         .join("\n");
 
     let mut all_hosts: Vec<String> = env_cfg.hosts.clone();
+    if let Some(p) = parent_ctx {
+        for h in &p.hosts {
+            if !all_hosts.contains(h) {
+                all_hosts.push(h.clone());
+            }
+        }
+    }
     for h in &scenario.front_matter.hosts {
         if !all_hosts.contains(h) {
             all_hosts.push(h.clone());
@@ -546,9 +585,31 @@ fn build_watcher_step_prompt(
         format!("\n## 検証環境の前提\n{}\n", env_lines.join("\n"))
     };
 
+    let parent_section = match parent_ctx {
+        Some(p) => {
+            let p_steps = p
+                .step_titles
+                .iter()
+                .map(|(n, t)| format!("  - Step {n}: {t}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n## 親シナリオ（前提として既に通過済みの本筋）\n- ID: {}\n- タイトル: {}\n- 概要:\n{}\n- 親ステップ:\n{}\n",
+                p.id, p.title, p.overview, p_steps
+            )
+        }
+        None => String::new(),
+    };
+
+    let role_target = if scenario.is_togaki() {
+        "ト書き（親シナリオに追加された枝葉・品質要件）"
+    } else {
+        "シナリオ"
+    };
+
     format!(
-        r#"あなたはシナリオ駆動の開発ハーネスの「見張り役（独立した自動検証エージェント）」です。
-対象プロダクトのソースコードは一切変更せず、以下のステップの各 `[auto]` チェック項目を実際にコマンド実行等で検証し、
+        r#"あなたはシナリオ駆動の開発ハーネス「Daihon」の「見張り役（独立した自動検証エージェント）」です。
+対象プロダクトのソースコードは一切変更せず、以下の{role_target}のステップに含まれる各 `[auto]` チェック項目を実際にコマンド実行等で検証し、
 事実に基づいた結果を JSON Schema 通りに返してください。
 
 厳守事項:
@@ -557,18 +618,19 @@ fn build_watcher_step_prompt(
 3. 推測で passed: true にしないこと。実際にコマンドを実行して確認した根拠を `command_run` と `evidence` に書くこと。
 4. 失敗した項目には、何が足りずどう失敗したかを `reason` に具体的に書くこと。
 
-## シナリオ情報
+## 検証対象の{role_target}
 - ID: {}
 - タイトル: {}
 - 概要:
 {}
-{}
+{}{}
 ## 今回の検証対象: Step {}: {}
 {}
 "#,
         scenario.front_matter.id,
         scenario.front_matter.title,
         scenario.overview,
+        parent_section,
         env_section,
         step.number,
         step.title,

@@ -164,10 +164,47 @@ impl FromStr for VerifyMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioKind {
+    #[default]
+    Scenario,
+    Togaki,
+}
+
+impl fmt::Display for ScenarioKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScenarioKind::Scenario => f.write_str("scenario"),
+            ScenarioKind::Togaki => f.write_str("togaki"),
+        }
+    }
+}
+
+impl FromStr for ScenarioKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "scenario" => Ok(ScenarioKind::Scenario),
+            "togaki" => Ok(ScenarioKind::Togaki),
+            _ => Err(format!(
+                "invalid scenario kind '{s}' (expected 'scenario' or 'togaki')"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontMatter {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub kind: ScenarioKind,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub attach_step: Option<usize>,
     pub priority: Priority,
     pub status: ScenarioStatus,
     pub last_checked_at: Option<String>,
@@ -285,6 +322,19 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    pub fn is_togaki(&self) -> bool {
+        self.front_matter.kind == ScenarioKind::Togaki
+    }
+
+    /// Returns `true` when this scenario has progressed enough to unlock child Togaki
+    /// (all steps passed, or all automated steps passed awaiting manual check).
+    pub fn unlocks_children(&self) -> bool {
+        matches!(
+            self.front_matter.status,
+            ScenarioStatus::Passed | ScenarioStatus::ReadyForManual
+        )
+    }
+
     pub fn all_auto_checks_passed(&self) -> bool {
         self.steps.iter().all(Step::all_auto_passed)
     }
@@ -355,6 +405,15 @@ impl Scenario {
         out.push_str("---\n");
         out.push_str(&format!("id: {}\n", self.front_matter.id));
         out.push_str(&format!("title: {}\n", self.front_matter.title));
+        if self.front_matter.kind == ScenarioKind::Togaki {
+            out.push_str("kind: togaki\n");
+        }
+        if let Some(ref parent) = self.front_matter.parent {
+            out.push_str(&format!("parent: {parent}\n"));
+        }
+        if let Some(step_num) = self.front_matter.attach_step {
+            out.push_str(&format!("attach_step: {step_num}\n"));
+        }
         out.push_str(&format!("priority: {}\n", self.front_matter.priority));
         out.push_str(&format!("status: {}\n", self.front_matter.status));
         out.push_str(&format!(

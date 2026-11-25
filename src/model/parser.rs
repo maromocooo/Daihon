@@ -4,8 +4,8 @@ use chrono::DateTime;
 use serde_yml::Value;
 
 use crate::model::scenario::{
-    CheckItem, CheckState, FrontMatter, Priority, Scenario, ScenarioStatus, Step, StepStatus,
-    VerifyMode, format_optional_yaml, render_steps_body,
+    CheckItem, CheckState, FrontMatter, Priority, Scenario, ScenarioKind, ScenarioStatus, Step,
+    StepStatus, VerifyMode, format_optional_yaml, render_steps_body,
 };
 use crate::model::validator::ValidationIssue;
 
@@ -286,6 +286,74 @@ fn parse_front_matter(
         }
     };
 
+    let kind = match map.get(Value::String("kind".to_string())) {
+        None | Some(Value::Null) => ScenarioKind::Scenario,
+        Some(Value::String(s)) => match s.parse::<ScenarioKind>() {
+            Ok(k) => k,
+            Err(msg) => {
+                issues.push(ValidationIssue::new(
+                    path,
+                    find_front_matter_line(raw, "kind"),
+                    format!("front matter の `kind` が不正です: {msg}"),
+                ));
+                ScenarioKind::Scenario
+            }
+        },
+        Some(_) => {
+            issues.push(ValidationIssue::new(
+                path,
+                find_front_matter_line(raw, "kind"),
+                "front matter の `kind` は `scenario` または `togaki` である必要があります",
+            ));
+            ScenarioKind::Scenario
+        }
+    };
+
+    let parent = match map.get(Value::String("parent".to_string())) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            if !is_valid_kebab_id(s) {
+                issues.push(ValidationIssue::new(
+                    path,
+                    find_front_matter_line(raw, "parent"),
+                    format!("front matter の `parent` ('{s}') は kebab-case で記述してください"),
+                ));
+            }
+            Some(s.clone())
+        }
+        Some(_) => {
+            issues.push(ValidationIssue::new(
+                path,
+                find_front_matter_line(raw, "parent"),
+                "front matter の `parent` は null または非空のシナリオ ID である必要があります",
+            ));
+            None
+        }
+    };
+
+    let attach_step = match map.get(Value::String("attach_step".to_string())) {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) if v >= 1 => Some(v as usize),
+            _ => {
+                issues.push(ValidationIssue::new(
+                    path,
+                    find_front_matter_line(raw, "attach_step"),
+                    "front matter の `attach_step` は 1 以上の整数である必要があります",
+                ));
+                None
+            }
+        },
+        Some(_) => {
+            issues.push(ValidationIssue::new(
+                path,
+                find_front_matter_line(raw, "attach_step"),
+                "front matter の `attach_step` は 1 以上の整数である必要があります",
+            ));
+            None
+        }
+    };
+
     let last_checked_at = parse_optional_rfc3339(map, raw, "last_checked_at", path, issues);
     let last_checked_by = parse_optional_non_empty_str(map, raw, "last_checked_by", path, issues);
     let notified_pass_at = parse_optional_rfc3339(map, raw, "notified_pass_at", path, issues);
@@ -295,6 +363,9 @@ fn parse_front_matter(
     Some(FrontMatter {
         id,
         title,
+        kind,
+        parent,
+        attach_step,
         priority,
         status,
         last_checked_at,

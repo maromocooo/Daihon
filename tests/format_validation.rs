@@ -14,7 +14,7 @@ fn sample_scenarios_directory_passes_validation() {
         report.is_ok(),
         "見本シナリオが形式チェックを通るべきです: {report:#?}"
     );
-    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.files.len(), 3);
 }
 
 #[test]

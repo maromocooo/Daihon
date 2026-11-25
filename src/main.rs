@@ -16,10 +16,11 @@ use daihon::integrations::{
     InstallOptions, IntegrationTarget, install_integration_with_options,
 };
 use daihon::model::{
-    CheckState, Priority, ScenarioStatus, StepStatus, load_scenarios_from_dir, validate_path,
+    CheckState, Priority, Scenario, ScenarioKind, ScenarioStatus, StepStatus,
+    load_scenarios_from_dir, load_scenarios_tree, validate_file, validate_path,
 };
 use daihon::notify::{NotificationPayload, build_notifier, resolve_topic};
-use daihon::register::{propose_registration, save_registration};
+use daihon::register::{propose_registration, propose_togaki, save_registration};
 use daihon::runner::{AgentKind, build_runner};
 use daihon::tui::run_tui;
 use daihon::watcher::drift::{
@@ -31,7 +32,8 @@ use daihon::watcher::trigger::{
     record_last_watch_fingerprint, spawn_background_watch, stop_daemon_watch,
 };
 use daihon::watcher::{
-    WatchOptions, resolve_distinct_watcher_agent, update_check_manually, watch_scenario,
+    ParentContext, WatchOptions, resolve_distinct_watcher_agent, update_check_manually,
+    watch_scenario,
 };
 
 #[derive(Debug, Parser)]
@@ -97,6 +99,47 @@ enum Commands {
     Register {
         /// 自然言語のシナリオ説明（省略時は標準入力／対話プロンプトから読み込み）
         text: Option<String>,
+
+        /// 親シナリオ ID を指定してト書き（Togaki）として登録する
+        #[arg(long)]
+        parent: Option<String>,
+
+        /// 親シナリオの特定ステップに紐づける（--parent 併用時）
+        #[arg(long)]
+        attach_step: Option<usize>,
+
+        /// シナリオ保存先ディレクトリ（既定: 設定の scenarios_dir）
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// 登録に使用するエージェント（agy | codex | claude）
+        #[arg(long)]
+        agent: Option<AgentKind>,
+
+        /// 優先度を明示指定する（P0〜P3）
+        #[arg(long)]
+        priority: Option<Priority>,
+
+        /// 確認プロンプトをスキップして保存する
+        #[arg(long)]
+        yes: bool,
+
+        /// ファイルに保存せずプレビューと重複・優先度案のみ表示する
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// 既存シナリオへ枝葉の条件・派生ユースケースを「ト書き（Togaki）」として追加する
+    Togaki {
+        /// 紐づけ先の親シナリオ ID（例: seguito-ubuntu-blender）
+        parent_id: String,
+
+        /// 追加したい条件や派生ユースケースの自然言語説明
+        text: Option<String>,
+
+        /// 親シナリオの特定ステップに紐づける（任意）
+        #[arg(long)]
+        attach_step: Option<usize>,
 
         /// シナリオ保存先ディレクトリ（既定: 設定の scenarios_dir）
         #[arg(long)]
@@ -306,6 +349,9 @@ enum NotifyAction {
 #[derive(Debug, Serialize)]
 struct StatusSummaryRow {
     id: String,
+    kind: ScenarioKind,
+    parent: Option<String>,
+    blocked_by_parent: Option<String>,
     priority: Priority,
     status: ScenarioStatus,
     title: String,
@@ -413,6 +459,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
         Commands::Register {
             text,
+            parent,
+            attach_step,
+            dir,
+            agent,
+            priority,
+            yes,
+            dry_run,
+        } => {
+            if parent.is_none() && attach_step.is_some() {
+                bail!("`--attach-step` は `--parent <親ID>`（または `daihon togaki`）と一緒に指定してください");
+            }
+            let scenarios_dir = config.resolve_scenarios_dir(&workdir, dir.as_deref());
+            cmd_register_or_togaki(
+                &workdir,
+                &config,
+                &scenarios_dir,
+                parent.as_deref(),
+                attach_step,
+                text,
+                agent,
+                priority,
+                yes,
+                dry_run,
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Commands::Togaki {
+            parent_id,
+            text,
+            attach_step,
             dir,
             agent,
             priority,
@@ -420,61 +497,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
         } => {
             let scenarios_dir = config.resolve_scenarios_dir(&workdir, dir.as_deref());
-            let input = read_register_input(text)?;
-            let agent_kind = agent.unwrap_or(config.agents.register);
-            let runner = build_runner(agent_kind, &config)?;
-
-            println!("登録エージェント ({agent_kind}) でシナリオを構造化しています...");
-            let proposal = propose_registration(
-                &input,
-                &scenarios_dir,
-                runner.as_ref(),
+            cmd_register_or_togaki(
                 &workdir,
-                config.watcher.timeout_secs,
+                &config,
+                &scenarios_dir,
+                Some(&parent_id),
+                attach_step,
+                text,
+                agent,
+                priority,
+                yes,
+                dry_run,
             )?;
-
-            println!("\n=== 生成されたシナリオ案 ===");
-            println!("{}", proposal.scenario.render_new_markdown());
-
-            println!("=== 既存シナリオとの重なり ===");
-            if proposal.overlaps.is_empty() {
-                println!("重なりは検出されませんでした。");
-            } else {
-                for ov in &proposal.overlaps {
-                    println!(
-                        "- {} ({}): {}",
-                        ov.existing_id, ov.existing_title, ov.reason
-                    );
-                }
-            }
-
-            println!("\n=== 優先度案 ===");
-            println!(
-                "- 推奨: {} （理由: {}）",
-                proposal.priority_proposal.suggested, proposal.priority_proposal.rationale
-            );
-
-            if dry_run {
-                println!("\n(--dry-run のため保存せず終了します)");
-                return Ok(ExitCode::SUCCESS);
-            }
-
-            let chosen_priority = if let Some(p) = priority {
-                Some(p)
-            } else if yes {
-                None
-            } else {
-                match prompt_registration_confirmation(proposal.priority_proposal.suggested)? {
-                    ConfirmAction::Save(p) => p,
-                    ConfirmAction::Cancel => {
-                        println!("保存をキャンセルしました。");
-                        return Ok(ExitCode::SUCCESS);
-                    }
-                }
-            };
-
-            let saved = save_registration(&proposal, &scenarios_dir, chosen_priority)?;
-            println!("シナリオを保存しました: {}", saved.display());
             Ok(ExitCode::SUCCESS)
         }
 
@@ -557,6 +591,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 sandbox: Some(config.watcher.sandbox.clone()),
                 environment: config.environment.clone(),
                 drift: config.drift.clone(),
+                parent_context: None,
                 notify_topic: topic,
                 notify_on_ready_for_manual: config.notify.notify_on_ready_for_manual,
             };
@@ -869,16 +904,112 @@ fn cmd_validate(path: &Path, as_json: bool) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_register_or_togaki(
+    workdir: &Path,
+    config: &HarnessConfig,
+    scenarios_dir: &Path,
+    parent_id: Option<&str>,
+    attach_step: Option<usize>,
+    text: Option<String>,
+    agent: Option<AgentKind>,
+    priority: Option<Priority>,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let input = read_register_input(text, parent_id.is_some())?;
+    let agent_kind = agent.unwrap_or(config.agents.register);
+    let runner = build_runner(agent_kind, config)?;
+
+    let proposal = if let Some(pid) = parent_id {
+        println!("登録エージェント ({agent_kind}) で親 `{pid}` 向けのト書き（Togaki）を構造化しています...");
+        propose_togaki(
+            pid,
+            &input,
+            attach_step,
+            scenarios_dir,
+            runner.as_ref(),
+            workdir,
+            config.watcher.timeout_secs,
+        )?
+    } else {
+        println!("登録エージェント ({agent_kind}) でシナリオを構造化しています...");
+        propose_registration(
+            &input,
+            scenarios_dir,
+            runner.as_ref(),
+            workdir,
+            config.watcher.timeout_secs,
+        )?
+    };
+
+    let label = if parent_id.is_some() {
+        "ト書き（Togaki）案"
+    } else {
+        "シナリオ案"
+    };
+
+    println!("\n=== 生成された{label} ===");
+    println!("{}", proposal.scenario.render_new_markdown());
+
+    println!("=== 既存シナリオ／ト書きとの重なり ===");
+    if proposal.overlaps.is_empty() {
+        println!("重なりは検出されませんでした。");
+    } else {
+        for ov in &proposal.overlaps {
+            println!(
+                "- {} ({}): {}",
+                ov.existing_id, ov.existing_title, ov.reason
+            );
+        }
+    }
+
+    println!("\n=== 優先度案 ===");
+    println!(
+        "- 推奨: {} （理由: {}）",
+        proposal.priority_proposal.suggested, proposal.priority_proposal.rationale
+    );
+
+    if dry_run {
+        println!("\n(--dry-run のため保存せず終了します)");
+        return Ok(());
+    }
+
+    let chosen_priority = if let Some(p) = priority {
+        Some(p)
+    } else if yes {
+        None
+    } else {
+        match prompt_registration_confirmation(proposal.priority_proposal.suggested)? {
+            ConfirmAction::Save(p) => p,
+            ConfirmAction::Cancel => {
+                println!("保存をキャンセルしました。");
+                return Ok(());
+            }
+        }
+    };
+
+    let saved = save_registration(&proposal, scenarios_dir, chosen_priority)?;
+    if parent_id.is_some() {
+        println!("ト書きを保存しました: {}", saved.display());
+    } else {
+        println!("シナリオを保存しました: {}", saved.display());
+    }
+    Ok(())
+}
+
 fn cmd_status(
     scenarios_dir: &Path,
     state_dir: &Path,
     drift_cfg: &DriftConfig,
     as_json: bool,
 ) -> Result<()> {
-    let loaded = load_scenarios_from_dir(scenarios_dir)?;
-    let mut rows = Vec::with_capacity(loaded.len());
-    for item in loaded {
-        let sc = item.scenario;
+    let tree = load_scenarios_tree(scenarios_dir)?;
+    let mut rows = Vec::with_capacity(tree.len());
+    let mut tree_meta: Vec<(usize, bool)> = Vec::with_capacity(tree.len());
+
+    for entry in tree {
+        let sc = entry.loaded.scenario;
         let passed_steps = sc
             .steps
             .iter()
@@ -886,8 +1017,12 @@ fn cmd_status(
             .count();
         let stopped = sc.steps.iter().find(|s| s.status == StepStatus::Failed);
         let drift = analyze_scenario_drift(state_dir, &sc.front_matter.id, drift_cfg)?;
+        tree_meta.push((entry.depth, entry.is_last_sibling));
         rows.push(StatusSummaryRow {
             id: sc.front_matter.id,
+            kind: sc.front_matter.kind,
+            parent: sc.front_matter.parent,
+            blocked_by_parent: entry.blocked_by_parent,
             priority: sc.front_matter.priority,
             status: sc.front_matter.status,
             title: sc.front_matter.title,
@@ -898,7 +1033,7 @@ fn cmd_status(
             drift,
             last_checked_at: sc.front_matter.last_checked_at,
             last_checked_by: sc.front_matter.last_checked_by,
-            path: item.path,
+            path: entry.loaded.path,
         });
     }
 
@@ -915,25 +1050,47 @@ fn cmd_status(
         return Ok(());
     }
 
-    for row in &rows {
-        let badge = match row.status {
-            ScenarioStatus::Passed => "PASS",
-            ScenarioStatus::Failed => "FAIL",
-            ScenarioStatus::ReadyForManual => "WAIT",
-            ScenarioStatus::InProgress => "RUN ",
-            ScenarioStatus::Pending => "TODO",
+    for (row, (depth, is_last)) in rows.iter().zip(tree_meta.iter()) {
+        let prefix = if *depth > 0 {
+            let indent = "  ".repeat(depth - 1);
+            let branch = if *is_last { "└─ " } else { "├─ " };
+            format!("{indent}{branch}")
+        } else {
+            String::new()
         };
-        let stop_note = match (row.stopped_step, &row.failed_check) {
-            (Some(step), Some(cid)) => format!("  [停止: Step {step} / {cid}]"),
-            (Some(step), None) => format!("  [停止: Step {step}]"),
-            _ => String::new(),
+
+        let badge = if row.blocked_by_parent.is_some() {
+            "親待"
+        } else {
+            match row.status {
+                ScenarioStatus::Passed => "PASS",
+                ScenarioStatus::Failed => "FAIL",
+                ScenarioStatus::ReadyForManual => "WAIT",
+                ScenarioStatus::InProgress => "RUN ",
+                ScenarioStatus::Pending => "TODO",
+            }
         };
-        let drift_note = match &row.drift {
-            Some(d) if d.is_drifting => format!("  [DRIFT x{}]", d.consecutive_same_stop),
-            _ => String::new(),
+        let kind_tag = if row.kind == ScenarioKind::Togaki {
+            "[ト書き] "
+        } else {
+            ""
+        };
+        let extra_note = if let Some(ref pid) = row.blocked_by_parent {
+            format!("  [親待ち: {pid}]")
+        } else {
+            let stop_note = match (row.stopped_step, &row.failed_check) {
+                (Some(step), Some(cid)) => format!("  [停止: Step {step} / {cid}]"),
+                (Some(step), None) => format!("  [停止: Step {step}]"),
+                _ => String::new(),
+            };
+            let drift_note = match &row.drift {
+                Some(d) if d.is_drifting => format!("  [DRIFT x{}]", d.consecutive_same_stop),
+                _ => String::new(),
+            };
+            format!("{stop_note}{drift_note}")
         };
         println!(
-            "[{badge}] {} ({}/{}) {} — {}{stop_note}{drift_note}",
+            "{prefix}[{badge}] {} ({}/{}) {kind_tag}{} — {}{extra_note}",
             row.priority, row.passed_steps, row.total_steps, row.id, row.title
         );
     }
@@ -966,25 +1123,86 @@ fn run_watch_once(
         return Ok(true);
     };
 
-    let loaded = load_scenarios_from_dir(scenarios_dir)?;
-    let targets: Vec<_> = loaded
-        .into_iter()
-        .filter(|s| scenario_filter.is_none_or(|id| s.scenario.front_matter.id == id))
+    let tree = load_scenarios_tree(scenarios_dir)?;
+    let all_by_id: std::collections::HashMap<String, Scenario> = tree
+        .iter()
+        .map(|e| {
+            (
+                e.loaded.scenario.front_matter.id.clone(),
+                e.loaded.scenario.clone(),
+            )
+        })
         .collect();
 
-    if targets.is_empty() {
+    if scenario_filter.is_some_and(|id| !all_by_id.contains_key(id)) || tree.is_empty() {
         bail!("検証対象のシナリオが見つかりません");
     }
 
+    let mut satisfied_parents: std::collections::HashMap<String, Scenario> = tree
+        .iter()
+        .filter(|e| e.loaded.scenario.unlocks_children())
+        .map(|e| {
+            (
+                e.loaded.scenario.front_matter.id.clone(),
+                e.loaded.scenario.clone(),
+            )
+        })
+        .collect();
+
     let mut all_passed = true;
-    for target in targets {
+    for entry in tree {
+        let target = entry.loaded;
+        let id = target.scenario.front_matter.id.clone();
+
+        if let Some(filter_id) = scenario_filter
+            && id != filter_id
+        {
+            continue;
+        }
+
+        // Parent-gating: skip child Togaki unless its parent passed (or explicitly targeted).
+        if scenario_filter.is_none()
+            && let Some(ref parent_id) = target.scenario.front_matter.parent
+            && !satisfied_parents.contains_key(parent_id)
+        {
+            println!(
+                "SKIP [ト書き] [{}] {} (親シナリオ `{parent_id}` が未通過のため待機)",
+                target.scenario.front_matter.priority, id
+            );
+            continue;
+        }
+
+        let mut per_opts = options.clone();
+        if let Some(ref parent_id) = target.scenario.front_matter.parent {
+            per_opts.parent_context = satisfied_parents
+                .get(parent_id)
+                .or_else(|| all_by_id.get(parent_id))
+                .map(ParentContext::from_scenario);
+        }
+
+        let kind_label = if target.scenario.is_togaki() {
+            "[ト書き] "
+        } else {
+            ""
+        };
         println!(
-            "見張り実行中 ({}) : [{}] {}",
+            "見張り実行中 ({}) : {kind_label}[{}] {}",
             runner.name(),
             target.scenario.front_matter.priority,
-            target.scenario.front_matter.id
+            id
         );
-        let report = watch_scenario(&target.path, runner, notifier, options)?;
+        let report = watch_scenario(&target.path, runner, notifier, &per_opts)?;
+        if matches!(
+            report.new_status,
+            ScenarioStatus::Passed | ScenarioStatus::ReadyForManual
+        ) {
+            if let Ok(reloaded) = validate_file(&target.path) {
+                satisfied_parents.insert(id.clone(), reloaded);
+            }
+        } else {
+            satisfied_parents.remove(&id);
+        }
+
         if let Some(step) = report.stopped_step {
             all_passed = false;
             println!(
@@ -997,7 +1215,7 @@ fn run_watch_once(
             {
                 println!("  -> ⚠ ドリフト検知: {}", drift.reason);
             }
-            println!("     更新シナリオ: {}", report.scenario_path.display());
+            println!("     更新ファイル: {}", report.scenario_path.display());
             println!("     詳細ログ    : {}", report.report_path.display());
             println!(
                 "     優先タスク  : {}",
@@ -1012,7 +1230,7 @@ fn run_watch_once(
                 report.new_status,
                 if report.notified { "送信" } else { "なし" }
             );
-            println!("     更新シナリオ: {}", report.scenario_path.display());
+            println!("     更新ファイル: {}", report.scenario_path.display());
             println!("     詳細ログ    : {}", report.report_path.display());
         }
     }
@@ -1023,7 +1241,7 @@ fn run_watch_once(
     Ok(all_passed)
 }
 
-fn read_register_input(text_arg: Option<String>) -> Result<String> {
+fn read_register_input(text_arg: Option<String>, is_togaki: bool) -> Result<String> {
     if let Some(t) = text_arg {
         return Ok(t);
     }
@@ -1034,7 +1252,11 @@ fn read_register_input(text_arg: Option<String>) -> Result<String> {
         return Ok(buf);
     }
 
-    print!("登録したいシナリオを自然言語で入力してください: ");
+    if is_togaki {
+        print!("親シナリオへ追加したいト書き（枝葉の条件・派生機能）を自然言語で入力してください: ");
+    } else {
+        print!("登録したいシナリオを自然言語で入力してください: ");
+    }
     io::stdout().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::model::parser::parse_scenario_str;
-use crate::model::scenario::{CheckState, Scenario, ScenarioStatus, Step, StepStatus};
+use crate::model::scenario::{CheckState, Scenario, ScenarioKind, ScenarioStatus, Step, StepStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ValidationIssue {
@@ -159,11 +159,12 @@ pub fn validate_path(path: &Path) -> ValidationReport {
     let mut files = Vec::with_capacity(md_paths.len());
     let mut cross_file_issues = Vec::new();
     let mut seen_ids: HashMap<String, PathBuf> = HashMap::new();
+    let mut valid_scenarios: HashMap<String, (PathBuf, Scenario)> = HashMap::new();
 
     for file_path in md_paths {
         match validate_file(&file_path) {
             Ok(sc) => {
-                let id = sc.front_matter.id;
+                let id = sc.front_matter.id.clone();
                 if let Some(prev_path) = seen_ids.get(&id) {
                     cross_file_issues.push(ValidationIssue::new(
                         Some(&file_path),
@@ -175,6 +176,7 @@ pub fn validate_path(path: &Path) -> ValidationReport {
                     ));
                 } else {
                     seen_ids.insert(id.clone(), file_path.clone());
+                    valid_scenarios.insert(id.clone(), (file_path.clone(), sc));
                 }
                 files.push(FileValidationResult {
                     path: file_path,
@@ -194,6 +196,55 @@ pub fn validate_path(path: &Path) -> ValidationReport {
         }
     }
 
+    // Cross-file Togaki parent existence, attach_step bounds, and cycle detection.
+    for (id, (file_path, sc)) in &valid_scenarios {
+        if let Some(ref parent_id) = sc.front_matter.parent {
+            match valid_scenarios.get(parent_id) {
+                None => {
+                    cross_file_issues.push(ValidationIssue::new(
+                        Some(file_path),
+                        None,
+                        format!(
+                            "ト書き `{id}` の親シナリオ `parent: {parent_id}` が見つかりません"
+                        ),
+                    ));
+                }
+                Some((_, parent_sc)) => {
+                    if let Some(step_num) = sc.front_matter.attach_step
+                        && step_num > parent_sc.steps.len()
+                    {
+                        cross_file_issues.push(ValidationIssue::new(
+                            Some(file_path),
+                            None,
+                            format!(
+                                "ト書き `{id}` の `attach_step: {step_num}` が親シナリオ `{parent_id}` のステップ数 ({}) を超えています",
+                                parent_sc.steps.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            // Detect cycles in parent chain.
+            let mut visited: HashSet<&str> = HashSet::new();
+            visited.insert(id.as_str());
+            let mut cursor = Some(parent_id.as_str());
+            while let Some(curr) = cursor {
+                if !visited.insert(curr) {
+                    cross_file_issues.push(ValidationIssue::new(
+                        Some(file_path),
+                        None,
+                        format!("ト書き `{id}` の `parent` 参照に循環があります"),
+                    ));
+                    break;
+                }
+                cursor = valid_scenarios
+                    .get(curr)
+                    .and_then(|(_, s)| s.front_matter.parent.as_deref());
+            }
+        }
+    }
+
     ValidationReport {
         files,
         cross_file_issues,
@@ -205,6 +256,40 @@ fn validate_scenario_semantics(
     path: Option<&Path>,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    match scenario.front_matter.kind {
+        ScenarioKind::Togaki => match &scenario.front_matter.parent {
+            None => issues.push(ValidationIssue::new(
+                path,
+                None,
+                "`kind: togaki` のト書きには親シナリオ ID（`parent: <scenario-id>`）が必須です",
+            )),
+            Some(parent_id) if parent_id == &scenario.front_matter.id => {
+                issues.push(ValidationIssue::new(
+                    path,
+                    None,
+                    "ト書きの `parent` に自分自身の `id` は指定できません",
+                ));
+            }
+            Some(_) => {}
+        },
+        ScenarioKind::Scenario => {
+            if scenario.front_matter.parent.is_some() {
+                issues.push(ValidationIssue::new(
+                    path,
+                    None,
+                    "`parent` を指定する場合は `kind: togaki` を明記してください",
+                ));
+            }
+            if scenario.front_matter.attach_step.is_some() {
+                issues.push(ValidationIssue::new(
+                    path,
+                    None,
+                    "`attach_step` は `kind: togaki` でのみ指定できます",
+                ));
+            }
+        }
+    }
+
     if scenario.overview.trim().is_empty() {
         issues.push(ValidationIssue::new(
             path,

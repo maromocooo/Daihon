@@ -74,7 +74,7 @@ fn install_integrations_merges_rules_and_hooks_safely_and_idempotently() {
     .unwrap();
 
     let claude_files = install_integration(IntegrationTarget::Claude, claude_dir.path()).unwrap();
-    assert_eq!(claude_files.len(), 6); // skill + 3 commands + CLAUDE.md + settings.json
+    assert_eq!(claude_files.len(), 7); // skill + 4 commands + CLAUDE.md + settings.json
 
     let claude_md = fs::read_to_string(claude_dir.path().join("CLAUDE.md")).unwrap();
     assert!(claude_md.contains("# 既存 CLAUDE ルール"));

@@ -14,6 +14,7 @@ description: >-
 
 - **状況の確認**: `daihon status`（または `daihon status --json`）
 - **シナリオ登録**: `daihon register "<自然言語のシナリオ>"`（既存シナリオとの重複・優先度案を確認後に保存）
+- **ト書き（枝葉）登録**: `daihon togaki <parent-id> "<追加条件・派生機能>"`（親シナリオを壊さず子ト書きを追加）
 - **見張り実行**: `daihon watch`（開発役とは別エージェントで自動検証し、結果を `scenarios/*.md` へ書き戻す）
 - **足りない機能の起票・修正**: `daihon fix --plan-only` / `daihon fix`
 - **形式検証**: `daihon validate`

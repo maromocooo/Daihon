@@ -67,16 +67,28 @@ pub fn build_pass_payload(
         _ => "状態が更新されました",
     };
 
+    let (kind_label, parent_suffix) = if scenario.is_togaki() {
+        let parent_note = scenario
+            .front_matter
+            .parent
+            .as_deref()
+            .map(|p| format!("（親シナリオ: {p}）"))
+            .unwrap_or_default();
+        ("ト書き通過", parent_note)
+    } else {
+        ("シナリオ通過", String::new())
+    };
+
     let message = format!(
-        "[{}] {} — {}",
-        scenario.front_matter.priority, scenario.front_matter.title, suffix
+        "[{}] {} — {}{}",
+        scenario.front_matter.priority, scenario.front_matter.title, suffix, parent_suffix
     );
 
     NotificationPayload {
         scenario_id: scenario.front_matter.id.clone(),
         title: format!(
-            "[{}] シナリオ通過: {}",
-            scenario.front_matter.priority, scenario.front_matter.id
+            "[{}] {}: {}",
+            scenario.front_matter.priority, kind_label, scenario.front_matter.id
         ),
         priority: scenario.front_matter.priority,
         status,

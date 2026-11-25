@@ -6,11 +6,13 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{DriftConfig, EnvironmentConfig};
-use crate::model::scenario::{CheckState, Priority, ScenarioStatus, StepStatus};
-use crate::model::store::{LoadedScenario, load_scenarios_from_dir};
+use crate::model::scenario::{CheckState, Priority, Scenario, ScenarioStatus, StepStatus};
+use crate::model::store::{LoadedScenario, load_scenarios_from_dir, load_scenarios_tree};
 use crate::notify::Notifier;
 use crate::runner::{AgentRequest, AgentRunner, ExecutionMode};
-use crate::watcher::{WatchOptions, WatchRunReport, load_latest_run_for_scenario, watch_scenario};
+use crate::watcher::{
+    ParentContext, WatchOptions, WatchRunReport, load_latest_run_for_scenario, watch_scenario,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingFeatureTask {
@@ -76,6 +78,15 @@ pub fn create_missing_feature_task(
     latest_run: Option<&WatchRunReport>,
     state_dir: &Path,
 ) -> Result<MissingFeatureTask> {
+    create_missing_feature_task_with_parent(loaded, None, latest_run, state_dir)
+}
+
+pub fn create_missing_feature_task_with_parent(
+    loaded: &LoadedScenario,
+    parent_scenario: Option<&Scenario>,
+    latest_run: Option<&WatchRunReport>,
+    state_dir: &Path,
+) -> Result<MissingFeatureTask> {
     let sc = &loaded.scenario;
     let failed_step = sc
         .steps
@@ -133,6 +144,15 @@ pub fn create_missing_feature_task(
     fs::create_dir_all(&tasks_dir)?;
     let task_file = tasks_dir.join(format!("{task_id}.md"));
 
+    let parent_block = parent_scenario
+        .map(|p| {
+            format!(
+                "\n## 親シナリオ（既に通過済みの本筋 — 壊さないこと）\n- **[{}] {}** (`{}`)\n{}\n",
+                p.front_matter.priority, p.front_matter.title, p.front_matter.id, p.overview
+            )
+        })
+        .unwrap_or_default();
+
     let markdown_body = format!(
         r#"# 足りない機能の実装タスク: [{priority}] {title}
 
@@ -140,7 +160,7 @@ pub fn create_missing_feature_task(
 - 対象シナリオ: `{scenario_id}` ({scenario_path})
 - 止まったステップ: Step {step_num}: {step_title}
 - 失敗したチェック項目: `{check_id}` — {check_desc}
-
+{parent_block}
 ## ユーザーの目的（シナリオ概要）
 {overview}
 
@@ -208,29 +228,59 @@ where
         sandbox: options.watcher_sandbox.clone(),
         environment: options.environment.clone(),
         drift: options.drift.clone(),
+        parent_context: None,
         notify_topic: options.notify_topic.clone(),
         notify_on_ready_for_manual: options.notify_on_ready_for_manual,
     };
 
     if options.check_first {
-        let initial = load_scenarios_from_dir(&options.scenarios_dir)?;
-        for item in &initial {
+        let initial = load_scenarios_tree(&options.scenarios_dir)?;
+        let mut satisfied: std::collections::HashMap<String, Scenario> =
+            std::collections::HashMap::new();
+        for entry in &initial {
+            let item = &entry.loaded;
             if let Some(ref target) = options.target_scenario_id
                 && item.scenario.front_matter.id != *target
             {
+                if item.scenario.unlocks_children() {
+                    satisfied.insert(item.scenario.front_matter.id.clone(), item.scenario.clone());
+                }
                 continue;
             }
-            watch_scenario(&item.path, watcher_runner, notifier, &watch_opts)?;
+            if options.target_scenario_id.is_none()
+                && let Some(ref parent_id) = item.scenario.front_matter.parent
+                && !satisfied.contains_key(parent_id)
+            {
+                continue;
+            }
+            let mut per_opts = watch_opts.clone();
+            if let Some(ref parent_id) = item.scenario.front_matter.parent {
+                per_opts.parent_context = satisfied
+                    .get(parent_id)
+                    .map(ParentContext::from_scenario);
+            }
+            let rep = watch_scenario(&item.path, watcher_runner, notifier, &per_opts)?;
+            if matches!(
+                rep.new_status,
+                ScenarioStatus::Passed | ScenarioStatus::ReadyForManual
+            ) && let Ok(reloaded) = crate::model::validate_file(&item.path)
+            {
+                satisfied.insert(reloaded.front_matter.id.clone(), reloaded);
+            }
         }
     }
 
-    let target_loaded = select_failed_scenario(
+    let (mut current, parent_scenario) = select_failed_scenario(
         &options.scenarios_dir,
         options.target_scenario_id.as_deref(),
-    )?;
-    let Some(mut current) = target_loaded else {
+    )?
+    .map_or((None, None), |(c, p)| (Some(c), p));
+    let Some(mut current) = current.take() else {
         return Ok(LoopOutcome::NoFailedScenario);
     };
+
+    let mut target_watch_opts = watch_opts;
+    target_watch_opts.parent_context = parent_scenario.as_ref().map(ParentContext::from_scenario);
 
     let scenario_id = current.scenario.front_matter.id.clone();
     let scenario_path = current.path.clone();
@@ -240,7 +290,12 @@ where
 
     for iteration in 1..=max_iterations {
         let latest_run = load_latest_run_for_scenario(&options.state_dir, &scenario_id)?;
-        let task = create_missing_feature_task(&current, latest_run.as_ref(), &options.state_dir)?;
+        let task = create_missing_feature_task_with_parent(
+            &current,
+            parent_scenario.as_ref(),
+            latest_run.as_ref(),
+            &options.state_dir,
+        )?;
 
         if options.plan_only {
             return Ok(LoopOutcome::PlannedOnly { task });
@@ -271,7 +326,7 @@ where
         })?;
 
         // Independently re-verify from Step 1 using the Watcher agent.
-        let report = watch_scenario(&scenario_path, watcher_runner, notifier, &watch_opts)?;
+        let report = watch_scenario(&scenario_path, watcher_runner, notifier, &target_watch_opts)?;
         let resolved = matches!(
             report.new_status,
             ScenarioStatus::Passed | ScenarioStatus::ReadyForManual
@@ -312,13 +367,42 @@ where
 fn select_failed_scenario(
     scenarios_dir: &Path,
     target_id: Option<&str>,
-) -> Result<Option<LoadedScenario>> {
-    let scenarios = load_scenarios_from_dir(scenarios_dir)?;
-    let found = scenarios.into_iter().find(|item| {
-        let id_matches = target_id.is_none_or(|t| item.scenario.front_matter.id == t);
-        id_matches && item.scenario.front_matter.status == ScenarioStatus::Failed
-    });
-    Ok(found)
+) -> Result<Option<(LoadedScenario, Option<Scenario>)>> {
+    let tree = load_scenarios_tree(scenarios_dir)?;
+    let chosen = if let Some(tid) = target_id {
+        tree.iter().find(|e| {
+            e.loaded.scenario.front_matter.id == tid
+                && e.loaded.scenario.front_matter.status == ScenarioStatus::Failed
+        })
+    } else {
+        // Parent-first: prefer unblocked failed scenarios before child Togaki whose parent failed.
+        tree.iter()
+            .find(|e| {
+                e.blocked_by_parent.is_none()
+                    && e.loaded.scenario.front_matter.status == ScenarioStatus::Failed
+            })
+            .or_else(|| {
+                tree.iter()
+                    .find(|e| e.loaded.scenario.front_matter.status == ScenarioStatus::Failed)
+            })
+    };
+
+    let Some(entry) = chosen else {
+        return Ok(None);
+    };
+    let parent_sc = entry
+        .loaded
+        .scenario
+        .front_matter
+        .parent
+        .as_deref()
+        .and_then(|pid| {
+            tree.iter()
+                .find(|e| e.loaded.scenario.front_matter.id == pid)
+                .map(|e| e.loaded.scenario.clone())
+        });
+
+    Ok(Some((entry.loaded.clone(), parent_sc)))
 }
 
 fn build_developer_prompt(task: &MissingFeatureTask) -> String {

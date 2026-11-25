@@ -156,9 +156,10 @@ fn tui_renders_repository_sample_scenarios() {
     terminal.draw(|f| render(f, &app)).unwrap();
 
     let screen = buffer_to_string(&terminal);
-    assert!(screen.contains("Scenarios (2)"));
+    assert!(screen.contains("Scenarios (3)"));
     assert!(screen.contains("rio-herdr-cross-machine"));
     assert!(screen.contains("Step 2 [FAIL]"));
+    assert!(screen.contains("[ト書き]"));
 }
 
 #[test]

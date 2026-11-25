@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::scenario::{
-    CheckItem, CheckState, FrontMatter, Priority, Scenario, ScenarioStatus, Step, StepStatus,
-    VerifyMode,
+    CheckItem, CheckState, FrontMatter, Priority, Scenario, ScenarioKind, ScenarioStatus, Step,
+    StepStatus, VerifyMode,
 };
 use crate::model::store::{LoadedScenario, load_scenarios_from_dir};
 use crate::model::validator::{validate_file, validate_str};
@@ -82,6 +82,7 @@ pub fn registration_json_schema() -> Value {
             "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
             "priority_rationale": { "type": "string" },
             "tags": { "type": "array", "items": { "type": "string" } },
+            "hosts": { "type": "array", "items": { "type": "string" }, "description": "Optional SSH/remote host names involved in this scenario" },
             "overview": { "type": "string", "description": "Natural language description of user intent" },
             "steps": {
                 "type": "array",
@@ -141,9 +142,100 @@ pub fn propose_registration(
     let existing = load_scenarios_from_dir(scenarios_dir)?;
     let prompt = build_registration_prompt(natural_input, &existing);
 
+    build_proposal_from_agent(
+        &prompt,
+        &existing,
+        ScenarioKind::Scenario,
+        None,
+        None,
+        &[],
+        runner,
+        workdir,
+        timeout_secs,
+    )
+}
+
+/// Converts a natural language branch / refinement ("Togaki") attached to an existing parent
+/// scenario into a validated `kind: togaki` proposal without modifying the parent file.
+pub fn propose_togaki(
+    parent_id: &str,
+    natural_input: &str,
+    attach_step: Option<usize>,
+    scenarios_dir: &Path,
+    runner: &dyn AgentRunner,
+    workdir: &Path,
+    timeout_secs: u64,
+) -> Result<RegistrationProposal> {
+    if natural_input.trim().is_empty() {
+        bail!("ト書きの説明が空です。追加したい条件や派生ユースケースを自然言語で入力してください");
+    }
+
+    let existing = load_scenarios_from_dir(scenarios_dir)?;
+    let parent_loaded = existing
+        .iter()
+        .find(|s| s.scenario.front_matter.id == parent_id)
+        .ok_or_else(|| {
+            let available: Vec<&str> = existing
+                .iter()
+                .map(|s| s.scenario.front_matter.id.as_str())
+                .collect();
+            if available.is_empty() {
+                anyhow!(
+                    "親シナリオ `{parent_id}` が見つかりません（シナリオがまだ登録されていません）"
+                )
+            } else {
+                anyhow!(
+                    "親シナリオ `{parent_id}` が見つかりません（登録済み ID: {}）",
+                    available.join(", ")
+                )
+            }
+        })?;
+
+    let parent_sc = &parent_loaded.scenario;
+    if let Some(step_num) = attach_step
+        && (step_num == 0 || step_num > parent_sc.steps.len())
+    {
+        bail!(
+            "`--attach-step {step_num}` は親シナリオ `{parent_id}` のステップ範囲 (1〜{}) 外です",
+            parent_sc.steps.len()
+        );
+    }
+
+    let siblings: Vec<&LoadedScenario> = existing
+        .iter()
+        .filter(|s| s.scenario.front_matter.parent.as_deref() == Some(parent_id))
+        .collect();
+
+    let prompt = build_togaki_prompt(parent_sc, &siblings, natural_input, attach_step);
+
+    build_proposal_from_agent(
+        &prompt,
+        &existing,
+        ScenarioKind::Togaki,
+        Some(parent_id.to_string()),
+        attach_step,
+        &parent_sc.front_matter.hosts,
+        runner,
+        workdir,
+        timeout_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_proposal_from_agent(
+    prompt: &str,
+    existing: &[LoadedScenario],
+    kind: ScenarioKind,
+    parent: Option<String>,
+    attach_step: Option<usize>,
+    inherited_hosts: &[String],
+    runner: &dyn AgentRunner,
+    workdir: &Path,
+    timeout_secs: u64,
+) -> Result<RegistrationProposal> {
     let response = runner.run(&AgentRequest {
         working_dir: workdir.to_path_buf(),
-        prompt,
+        prompt: prompt.to_string(),
         json_schema: Some(registration_json_schema()),
         mode: ExecutionMode::ReadOnly,
         sandbox_override: None,
@@ -218,17 +310,25 @@ pub fn propose_registration(
         .filter(|t| !t.is_empty())
         .collect();
 
-    let hosts = draft
+    let mut hosts: Vec<String> = inherited_hosts.to_vec();
+    for h in draft
         .hosts
         .into_iter()
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
-        .collect();
+    {
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
 
     let scenario = Scenario {
         front_matter: FrontMatter {
             id: unique_id,
             title: draft.title.trim().to_string(),
+            kind,
+            parent: parent.clone(),
+            attach_step,
             priority,
             status: ScenarioStatus::Pending,
             last_checked_at: None,
@@ -258,6 +358,10 @@ pub fn propose_registration(
     let mut overlaps = Vec::new();
     let mut reported_ids = HashSet::new();
     for item in draft.overlaps {
+        if parent.as_deref() == Some(item.existing_id.as_str()) {
+            // Do not flag the intended parent scenario itself as an accidental duplicate.
+            continue;
+        }
         if let Some(found) = existing
             .iter()
             .find(|s| s.scenario.front_matter.id == item.existing_id)
@@ -272,9 +376,9 @@ pub fn propose_registration(
     }
 
     // Supplement with deterministic tag/keyword overlap detection if missed by the LLM.
-    for ex in &existing {
+    for ex in existing {
         let ex_id = &ex.scenario.front_matter.id;
-        if reported_ids.contains(ex_id) {
+        if parent.as_deref() == Some(ex_id.as_str()) || reported_ids.contains(ex_id) {
             continue;
         }
         if let Some(reason) = detect_lexical_overlap(&scenario, &ex.scenario) {
@@ -370,16 +474,18 @@ fn build_registration_prompt(natural_input: &str, existing: &[LoadedScenario]) -
     };
 
     format!(
-        r#"あなたはシナリオ駆動の開発ハーネスの「シナリオ登録役」です。
+        r#"あなたはシナリオ駆動の開発ハーネス「Daihon（台本）」の登録役です。
 ユーザーの自然言語による要望を、開発エージェントと検証エージェント（見張り役）が共有できる
-明確なシナリオへ分解し、指定された JSON Schema に厳密に従って返してください。
+明確なシナリオ（台本）へ分解し、指定された JSON Schema に厳密に従って返してください。
 
 ルール:
-1. id は小文字英数字とハイフンの kebab-case（例: rio-herdr-cross-machine）にする。
-2. overview には、ユーザーが本当に試したい使い方・目的を自然な日本語で残す。
-3. steps は利用の流れに沿った順序に分け、各ステップの checks に具体的な OK 条件を書く。
-4. チェック項目はコマンド・テスト・SSH 等で自動検証できるものを `auto`、実機 GUI 表示や操作感など人の確認が必要なものを `manual` に分類する。
-5. チェック ID は `s1-c1`, `s1-c2`, `s2-c1` のように一意にする。
+1. id は小文字英数字とハイフンの kebab-case（例: seguito-ubuntu-blender）にする。
+2. overview には、ユーザーが本当にドッグフーディングしたい使い方・最終体験を自然な日本語で残す。
+3. 粒度の扱い:
+   - 「MacBook Air でアプリを開き、Ubuntu 側の Blender を起動して編集できる」のような大きな E2E 体験も、小さな部品へ矮小化せず **3〜6 個の大きな到達マイルストーン（起動/接続 → リモートアプリ起動 → 編集/保存 等）** としてそのまま設計する。
+   - 細かい遅延条件や派生機能はあとから `daihon togaki`（ト書き）で枝葉として追加できる前提にし、まずは本筋の E2E が通るステップに絞る。
+4. チェック項目はコマンド・テスト・SSH・プロセス・API・数値計測で自動検証できるものを `auto`、実機 GUI の描画品質や操作感など人の確認が必要なものを `manual` に分類する。
+5. チェック ID は `s1-c1`, `s1-c2`, `s2-c1` のように一意にする。複数マシンが登場する場合は `hosts` にも候補ホスト名を入れる。
 6. 既存シナリオと重なる部分があれば `overlaps` に該当 `existing_id` と重なり理由を挙げる。
 7. 既存シナリオとの相対的な重要度から `priority`（P0〜P3）と `priority_rationale` を提案する。
 
@@ -389,6 +495,79 @@ fn build_registration_prompt(natural_input: &str, existing: &[LoadedScenario]) -
 ## ユーザーの新しいシナリオ要望
 {natural_input}
 "#
+    )
+}
+
+fn build_togaki_prompt(
+    parent: &Scenario,
+    siblings: &[&LoadedScenario],
+    natural_input: &str,
+    attach_step: Option<usize>,
+) -> String {
+    let parent_steps = parent
+        .steps
+        .iter()
+        .map(|s| format!("  - Step {}: {}", s.number, s.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let sibling_summary = if siblings.is_empty() {
+        "（この親シナリオ配下の既存ト書きはまだありません）".to_string()
+    } else {
+        siblings
+            .iter()
+            .map(|s| {
+                let sc = &s.scenario;
+                format!(
+                    "- id: {} | priority: {} | title: {}",
+                    sc.front_matter.id, sc.front_matter.priority, sc.front_matter.title
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let attach_note = match attach_step {
+        Some(n) => format!("\n- 特に紐づく親ステップ: Step {n}"),
+        None => String::new(),
+    };
+
+    format!(
+        r#"あなたはシナリオ駆動の開発ハーネス「Daihon（台本）」の **ト書き（Togaki）** 登録役です。
+既に存在する親シナリオ（本筋の台本）が通った前提のうえで、ユーザーから追加された
+枝葉の要件・非機能条件（例: 遅延が xxx ms 以内）・派生ユースケース（例: ローカル素材を引き渡せる）を
+コンパクトなト書きとして構造化し、指定された JSON Schema に厳密に従って返してください。
+
+ルール:
+1. 親シナリオの基本ステップ（アプリ起動や基本接続など）は「既に通過済み」の前提として重複定義せず、**今回追加された差分条件・派生フローだけ** をステップ化する。
+   - 単一の品質・パフォーマンス条件（例: 遅延 50ms 以内）なら 1 ステップ・1〜2 チェックで簡潔に作る。
+   - 複数段階の派生機能（例: ローカル素材の選択 → 転送 → リモートアプリで読込）なら 2〜3 ステップに分ける。
+2. id は親シナリオとの関係が分かる kebab-case にする（例: {parent_id}-latency）。
+3. 自動計測・コマンド・SSH 等で検証できる項目は `auto`、人の体感確認が必要な項目は `manual` に分類する。
+4. 同じ親にぶら下がる既存ト書きと重なる部分があれば `overlaps` に挙げる（親シナリオ自身は `overlaps` に入れない）。
+5. 親シナリオ（{parent_priority}）との関係を踏まえ、`priority`（P0〜P3）と `priority_rationale` を提案する。
+
+## 親シナリオ（前提となる本筋）
+- ID: {parent_id}
+- タイトル: {parent_title}
+- 優先度: {parent_priority}
+- 対象ホスト: [{parent_hosts}]{attach_note}
+- 概要:
+{parent_overview}
+- ステップ:
+{parent_steps}
+
+## 同じ親配下の既存ト書き
+{sibling_summary}
+
+## 今回追加したいト書き（枝葉の要件）
+{natural_input}
+"#,
+        parent_id = parent.front_matter.id,
+        parent_title = parent.front_matter.title,
+        parent_priority = parent.front_matter.priority,
+        parent_hosts = parent.front_matter.hosts.join(", "),
+        parent_overview = parent.overview,
     )
 }
 

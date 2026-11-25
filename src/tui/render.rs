@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::model::scenario::{CheckState, Scenario, ScenarioStatus, StepStatus, VerifyMode};
-use crate::tui::app::{App, FocusPane};
+use crate::model::store::TreeEntry;
+use crate::tui::app::{App, ChildrenSummary, FocusPane};
 use crate::watcher::drift::DriftSummary;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -16,7 +17,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(vertical[0]);
 
     render_scenario_list(frame, app, columns[0]);
@@ -34,22 +35,27 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(format!(" Scenarios ({}) ", app.scenarios.len()));
+        .title(format!(" Scenarios ({}) ", app.entries.len()));
 
-    if app.scenarios.is_empty() {
-        let empty = Paragraph::new("シナリオがありません。\n`daihon register` で登録してください。")
-            .block(block)
-            .wrap(Wrap { trim: true });
+    if app.entries.is_empty() {
+        let empty =
+            Paragraph::new("シナリオがありません。\n`daihon register` で登録してください。")
+                .block(block)
+                .wrap(Wrap { trim: true });
         frame.render_widget(empty, area);
         return;
     }
 
     let items: Vec<ListItem> = app
-        .scenarios
+        .entries
         .iter()
-        .map(|loaded| {
-            let sc = &loaded.scenario;
-            let (badge, color) = scenario_badge(sc.front_matter.status);
+        .map(|entry| {
+            let sc = &entry.loaded.scenario;
+            let (badge, color) = if entry.blocked_by_parent.is_some() {
+                ("親待", Color::DarkGray)
+            } else {
+                scenario_badge(sc.front_matter.status)
+            };
             let passed_steps = sc
                 .steps
                 .iter()
@@ -57,18 +63,36 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                 .count();
             let total_steps = sc.steps.len();
 
-            let mut spans = vec![
-                Span::styled(
-                    format!("[{badge}]"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" {} ", sc.front_matter.priority)),
-                Span::styled(
-                    format!("{passed_steps}/{total_steps} "),
+            let mut spans = Vec::new();
+            if entry.depth > 0 {
+                let indent = "  ".repeat(entry.depth - 1);
+                let branch = if entry.is_last_sibling {
+                    "└─ "
+                } else {
+                    "├─ "
+                };
+                spans.push(Span::styled(
+                    format!("{indent}{branch}"),
                     Style::default().fg(Color::DarkGray),
-                ),
-            ];
-            if let Some(drift) = app.drift_for(&sc.front_matter.id)
+                ));
+            }
+            spans.push(Span::styled(
+                format!("[{badge}]"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(format!(" {} ", sc.front_matter.priority)));
+            spans.push(Span::styled(
+                format!("{passed_steps}/{total_steps} "),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if sc.is_togaki() {
+                spans.push(Span::styled(
+                    "[ト書き] ",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if entry.blocked_by_parent.is_none()
+                && let Some(drift) = app.drift_for(&sc.front_matter.id)
                 && drift.is_drifting
             {
                 spans.push(Span::styled(
@@ -105,18 +129,22 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let Some(loaded) = app.selected_scenario() else {
+    let Some(entry) = app.selected_entry() else {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
             .title(" Detail ");
-        frame.render_widget(Paragraph::new("シナリオを選択してください").block(block), area);
+        frame.render_widget(
+            Paragraph::new("シナリオを選択してください").block(block),
+            area,
+        );
         return;
     };
 
-    let sc = &loaded.scenario;
+    let sc = &entry.loaded.scenario;
+    let kind_prefix = if sc.is_togaki() { "[ト書き] " } else { "" };
     let title = format!(
-        " [{}] {} ",
+        " {kind_prefix}[{}] {} ",
         sc.front_matter.priority, sc.front_matter.title
     );
     let block = Block::default()
@@ -124,7 +152,12 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .title(title);
 
-    let lines = build_detail_lines(sc, app.drift_for(&sc.front_matter.id));
+    let children_summary = app.children_summary_for(&sc.front_matter.id);
+    let lines = build_detail_lines(
+        entry,
+        app.drift_for(&sc.front_matter.id),
+        &children_summary,
+    );
     let detail = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
@@ -133,7 +166,12 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(detail, area);
 }
 
-fn build_detail_lines(sc: &Scenario, drift: Option<&DriftSummary>) -> Vec<Line<'static>> {
+fn build_detail_lines(
+    entry: &TreeEntry,
+    drift: Option<&DriftSummary>,
+    children: &ChildrenSummary,
+) -> Vec<Line<'static>> {
+    let sc: &Scenario = &entry.loaded.scenario;
     let mut lines = Vec::new();
     let (badge, color) = scenario_badge(sc.front_matter.status);
 
@@ -155,6 +193,28 @@ fn build_detail_lines(sc: &Scenario, drift: Option<&DriftSummary>) -> Vec<Line<'
         ),
         Span::raw(format!("   ID: {}", sc.front_matter.id)),
     ]));
+
+    if sc.is_togaki() {
+        let parent_id = sc.front_matter.parent.as_deref().unwrap_or("-");
+        let mut togaki_spans = vec![
+            Span::styled("種別: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("ト書き (Togaki)", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("   親シナリオ: {parent_id}")),
+        ];
+        if let Some(step_num) = sc.front_matter.attach_step {
+            togaki_spans.push(Span::raw(format!(" (Step {step_num})")));
+        }
+        lines.push(Line::from(togaki_spans));
+    } else if children.total > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("紐づくト書き: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{} 件（通過 {} / 停止 {} / 未検証 {}）",
+                children.total, children.passed, children.failed, children.pending
+            )),
+        ]));
+    }
+
     lines.push(Line::from(vec![
         Span::styled("最終確認: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(checked_info),
@@ -174,7 +234,15 @@ fn build_detail_lines(sc: &Scenario, drift: Option<&DriftSummary>) -> Vec<Line<'
         ]));
     }
 
-    if let Some(d) = drift
+    if let Some(ref blocker) = entry.blocked_by_parent {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "⏳ 親シナリオ `{blocker}` が未通過のため待機中（親が通過すると自動で見張り対象になります）"
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(d) = drift
         && d.is_drifting
     {
         lines.push(Line::raw(""));

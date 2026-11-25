@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DriftConfig;
 use crate::model::scenario::{CheckState, ScenarioStatus, StepStatus};
-use crate::model::store::load_scenarios_from_dir;
+use crate::model::store::load_scenarios_tree;
 use crate::watcher::WatchRunReport;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,33 +194,67 @@ pub fn sync_next_task_file(
 ) -> Result<PathBuf> {
     fs::create_dir_all(state_dir)?;
     let next_task_path = state_dir.join("NEXT_TASK.md");
-    let loaded = load_scenarios_from_dir(scenarios_dir)?;
+    let tree = load_scenarios_tree(scenarios_dir)?;
     let now = Local::now().to_rfc3339();
 
-    let top_failed = loaded
+    // Always prioritize unblocked failed scenarios (so a failed parent comes before child Togaki).
+    let top_failed = tree
         .iter()
-        .find(|item| item.scenario.front_matter.status == ScenarioStatus::Failed);
+        .find(|entry| {
+            entry.blocked_by_parent.is_none()
+                && entry.loaded.scenario.front_matter.status == ScenarioStatus::Failed
+        })
+        .or_else(|| {
+            tree.iter()
+                .find(|entry| entry.loaded.scenario.front_matter.status == ScenarioStatus::Failed)
+        });
 
     let body = match top_failed {
         None => {
-            let pending_count = loaded
+            let pending_count = tree
                 .iter()
-                .filter(|s| s.scenario.front_matter.status == ScenarioStatus::Pending)
+                .filter(|e| e.loaded.scenario.front_matter.status == ScenarioStatus::Pending)
                 .count();
-            let ready_count = loaded
+            let ready_count = tree
                 .iter()
-                .filter(|s| s.scenario.front_matter.status == ScenarioStatus::ReadyForManual)
+                .filter(|e| e.loaded.scenario.front_matter.status == ScenarioStatus::ReadyForManual)
                 .count();
             format!(
                 "# 現在の最優先タスク（daihon）\n\n\
                  - 更新日時: {now}\n\
-                 - 状態: 現在、失敗中（`failed`）のシナリオはありません（確認待ち: {ready_count} 件 / 未検証: {pending_count} 件）。\n"
+                 - 状態: 現在、失敗中（`failed`）のシナリオ／ト書きはありません（確認待ち: {ready_count} 件 / 未検証: {pending_count} 件）。\n"
             )
         }
-        Some(item) => {
+        Some(entry) => {
+            let item = &entry.loaded;
             let sc = &item.scenario;
             let failed_step = sc.steps.iter().find(|s| s.status == StepStatus::Failed);
             let drift = analyze_scenario_drift(state_dir, &sc.front_matter.id, drift_cfg)?;
+
+            let parent_section = sc
+                .front_matter
+                .parent
+                .as_deref()
+                .and_then(|pid| {
+                    tree.iter()
+                        .find(|e| e.loaded.scenario.front_matter.id == pid)
+                })
+                .map(|p| {
+                    format!(
+                        "\n## 親シナリオ（壊してはならない本筋）\n- **[{}] {}** (`{}`)\n{}\n",
+                        p.loaded.scenario.front_matter.priority,
+                        p.loaded.scenario.front_matter.title,
+                        p.loaded.scenario.front_matter.id,
+                        p.loaded.scenario.overview
+                    )
+                })
+                .unwrap_or_default();
+
+            let kind_label = if sc.is_togaki() {
+                "ト書き"
+            } else {
+                "シナリオ"
+            };
 
             let drift_section = match &drift {
                 Some(d) if d.is_drifting => format!(
@@ -259,17 +293,17 @@ pub fn sync_next_task_file(
             format!(
                 "# 現在の最優先タスク（daihon 自動生成）\n\n\
                  - 更新日時: {now}\n\
-                 - 最優先停止シナリオ: **[{}] {}** (`{}`)\n\
-                 - シナリオファイル: `{}`\n\
+                 - 最優先停止{kind_label}: **[{}] {}** (`{}`)\n\
+                 - ファイル: `{}`\n\
                  - 止まったステップ: {}\n\
                  - 失敗したチェック項目: {}\n\
                  - 失敗理由: {}\n\
-                 {drift_section}\n\
+                 {drift_section}{parent_section}\n\
                  ## ユーザーが実現したい使い方（概要）\n\
                  {}\n\n\
                  ## 開発役エージェントへの指示\n\
                  1. 単体パーツより先に、上記の失敗チェック項目を通すための不足機能を実装してください。\n\
-                 2. ユーザーから指摘される前に「最優先シナリオの {} を通すため、この機能を作りましょう」と提案・着手してください。\n\
+                 2. ユーザーから指摘される前に「最優先{kind_label}の {} を通すため、この機能を作りましょう」と提案・着手してください。\n\
                  3. 実装後は `daihon watch --scenario {}` で別エージェント検証を通るか確認してください。\n",
                 sc.front_matter.priority,
                 sc.front_matter.title,
@@ -296,19 +330,19 @@ pub fn render_agent_context(
     state_dir: &Path,
     drift_cfg: &DriftConfig,
 ) -> Result<String> {
-    let loaded = load_scenarios_from_dir(scenarios_dir)?;
-    if loaded.is_empty() {
+    let tree = load_scenarios_tree(scenarios_dir)?;
+    if tree.is_empty() {
         return Ok(String::new());
     }
 
     let mut lines = Vec::new();
-    lines.push("[daihon] 現在の登録シナリオ状況（優先度順）:".to_string());
+    lines.push("[daihon] 現在の登録シナリオ・ト書き状況（優先度・親子順）:".to_string());
 
     let mut drifting_alerts = Vec::new();
     let mut top_failed_id: Option<String> = None;
 
-    for item in loaded.iter().take(5) {
-        let sc = &item.scenario;
+    for entry in tree.iter().take(8) {
+        let sc = &entry.loaded.scenario;
         let drift = analyze_scenario_drift(state_dir, &sc.front_matter.id, drift_cfg)?;
         let drift_tag = match &drift {
             Some(d) if d.is_drifting => {
@@ -321,7 +355,21 @@ pub fn render_agent_context(
             _ => String::new(),
         };
 
-        let stop_info = if sc.front_matter.status == ScenarioStatus::Failed {
+        let prefix = if entry.depth > 0 {
+            let branch = if entry.is_last_sibling { "└─" } else { "├─" };
+            format!("{} {branch} [ト書き] ", "  ".repeat(entry.depth))
+        } else {
+            "- ".to_string()
+        };
+
+        let blocked_note = match &entry.blocked_by_parent {
+            Some(pid) => format!(" (親待ち: {pid})"),
+            None => String::new(),
+        };
+
+        let stop_info = if entry.blocked_by_parent.is_none()
+            && sc.front_matter.status == ScenarioStatus::Failed
+        {
             if top_failed_id.is_none() {
                 top_failed_id = Some(sc.front_matter.id.clone());
             }
@@ -341,11 +389,12 @@ pub fn render_agent_context(
         };
 
         lines.push(format!(
-            "- [{}] {} `{}`: {}{}{}",
+            "{prefix}[{}] {} `{}`: {}{}{}{}",
             sc.front_matter.priority,
             sc.front_matter.status,
             sc.front_matter.id,
             sc.front_matter.title,
+            blocked_note,
             stop_info,
             drift_tag
         ));
@@ -361,7 +410,7 @@ pub fn render_agent_context(
         let next_task = state_dir.join("NEXT_TASK.md");
         lines.push(String::new());
         lines.push(format!(
-            "方針: 単体パーツより最優先シナリオの停止ステップ解消を優先してください。詳細: {}",
+            "方針: 単体パーツより最優先シナリオ（親→ト書き順）の停止ステップ解消を優先してください。詳細: {}",
             next_task.display()
         ));
     }
