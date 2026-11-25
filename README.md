@@ -6,61 +6,94 @@
   </picture>
 </p>
 
-# Daihon（シナリオ駆動の開発ハーネス）
+<p align="center">
+  <strong>English</strong> | <a href="README.ja.md">日本語</a>
+</p>
 
-コーディングエージェントに開発を任せた際に「一番試したい使い方（シナリオ）」が後回しになったりズレたりする問題を防ぐための、**自然言語登録・別エージェント見張り・最小 TUI・開発ループ・スマホ通知（ntfy）・コマンド連携**ハーネスです。
+# Daihon — Scenario-Driven Development Harness for Coding Agents
 
-> **シナリオの YAML / Markdown は手で書く必要はありません。**  
-> `daihon register "〜したい"` と自然言語で話すだけで、保存形式（Markdown + YAML front matter）へ自動変換され、既存シナリオとの重複チェックと優先度案が提示されます。
+**Daihon** (台本, *"script"*) keeps autonomous coding agents aligned with the end-to-end user scenarios you actually want to dogfood—through **natural-language scenario registration, independent watcher verification, a minimal TUI, drift detection, smartphone notifications (`ntfy`), and CLI agent integrations (`agy` / `codex` / `claude`)**.
 
-## ドキュメント
-- **新規・既存プロジェクトへの組み込み手順と日常運用**: [docs/getting-started.md](docs/getting-started.md)
-- **シナリオ保存形式の仕様**: [docs/scenario-format.md](docs/scenario-format.md)
+> **You never need to hand-write YAML or Markdown.**  
+> Just describe what you want in natural language via `daihon register "..."`. Daihon converts it into a human-readable Markdown + YAML front matter scenario, checks for overlaps with existing scenarios, and suggests a priority (`P0`–`P3`).
 
-## インストール
+## Why Daihon?
+
+When you delegate implementation to coding agents, they frequently drift toward small, isolated parts while postponing the core end-to-end workflow you want to dogfood first—and you often notice too late.
+
+Daihon closes the loop:
+
+1. **Always-On alignment**: Injects your `P0` scenarios and current progress into coding agent sessions (`AGENTS.md` / `CLAUDE.md` rules + `SessionStart` hooks).
+2. **Independent watcher**: A **separate agent** (e.g., `codex` watching `claude`/`agy`) automatically tests each step in the background (`auto` checks via commands/SSH, while keeping `manual` GUI checks separate) and records exactly which step and check failed.
+3. **Drift detection & automatic handoff**: Flags `[DRIFT]` when code changes keep happening without advancing the stopped step, and keeps `.daihon/NEXT_TASK.md` up to date so agents self-correct before you have to intervene.
+4. **Signal-only phone notifications**: Sends a smartphone notification via [ntfy](https://ntfy.sh/) **only** when a scenario passes all steps—never spamming you on individual parts or partial progress.
+
+## Install
+
+Requires Rust / Cargo (`rustc 1.85+`, edition 2024):
+
 ```bash
+git clone git@github.com:maromocooo/Daihon.git
+cd Daihon
 cargo install --path .
 ```
 
-## 最小の導入手順（新規・既存プロジェクト共通）
+## Quick Start (New or Existing Repository)
+
 ```bash
 cd /path/to/your-project
-daihon init                       # .daihon.toml と scenarios/ を作成
+daihon init                           # Creates .daihon.toml and scenarios/
 echo '.daihon/' >> .gitignore
-daihon init-integration agy       # agy / codex / claude から選択して導入
+daihon init-integration agy           # Or: codex / claude (merges Skill, rules & hooks safely)
 
-# 1. 自然言語でシナリオを登録（重複と優先度案を確認して保存）
-daihon register "最初に試したい使い方を自然言語で書く"
+# 1. Register your core dogfooding scenario in natural language
+daihon register "Launch the terminal workflow and seamlessly continue development across hosts"
 
-# 2. 開発役とは別のエージェントで裏検証
+# 2. Verify with an independent watcher agent
 daihon watch
 
-# 3. 最小 TUI で一覧・優先度・停止位置を確認
+# 3. Inspect priorities, step progress, and drift warnings in the minimal TUI
 daihon tui
 
-# 4. 止まったステップから「足りない機能を作る」タスク起票・修正ループ
-daihon fix --plan-only            # タスク起票のみ
-daihon fix                        # 承認を挟んで開発役 → 見張り役で再検証
+# 4. File a missing-feature task from the stopped step & run the approval-gated fix loop
+daihon fix --plan-only                # Generate task file only
+daihon fix                            # Approve -> developer implements -> watcher re-verifies
 ```
 
-## 主なコマンド一覧
+### Smartphone Notifications (`ntfy`)
 
-| コマンド | 役割 |
+Subscribe to a private topic in the iOS/Android [ntfy](https://ntfy.sh/) app and export it:
+
+```bash
+export DAIHON_NTFY_TOPIC="your-private-topic"
+daihon notify test
+```
+
+## Command Reference
+
+| Command | Description |
 | :--- | :--- |
-| `daihon init` | `.daihon.toml` と `scenarios/` を作成 |
-| `daihon validate [path]` | 保存形式と状態整合性をチェック（段階 1） |
-| `daihon tui [--dir ...]` | 最小 TUI で一覧・優先度・ステップ状況・`[DRIFT]` 警告を表示（段階 2） |
-| `daihon status [--json]` | 非対話で一覧・停止箇所・ドリフト状態を表示（段階 2） |
-| `daihon context` | 開発役エージェントへ渡す現在地・ドリフト要約を出力 |
-| `daihon register "<自然言語>"` | 自然言語からシナリオ生成・重複検出・優先度案提示（段階 3） |
-| `daihon watch [--if-changed \| --background \| --interval 15m \| --stop \| --daemon-status]` | 開発役とは別エージェントで見張り実行・裏デーモン管理（段階 4） |
-| `daihon check <id> <check-id> --pass` | `[manual]` 項目などの手動チェック更新（段階 4） |
-| `daihon hook install` | git `post-commit` にバックグラウンド見張りを設置（段階 4） |
-| `daihon fix [--plan-only \| --auto-approve]` | 停止ステップからタスク起票→開発役→再見張り（段階 5） |
-| `daihon notify test [--dry-run]` | `ntfy` スマホ通知の疎通テスト（段階 6） |
-| `daihon init-integration <agy\|codex\|claude> [--no-rules \| --no-hooks]` | Skill・Always-On ルール・ライフサイクルフックを安全にマージ導入（段階 7） |
+| `daihon init` | Initialize `.daihon.toml` and `scenarios/` in a repository |
+| `daihon validate [path]` | Validate scenario Markdown/front matter format and status consistency |
+| `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (list, priorities, step checks, `[DRIFT]` alerts) |
+| `daihon status [--json]` | Print non-interactive scenario status summary and stopped steps |
+| `daihon context` | Output concise current-state / drift brief for coding agent sessions |
+| `daihon register "<text>"` | Turn natural language into a structured scenario with overlap & priority proposals |
+| `daihon watch [--if-changed \| --background \| --interval 15m \| --stop \| --daemon-status]` | Run independent watcher verification or manage the background periodic daemon |
+| `daihon check <id> <check-id> --pass` | Mark `[manual]` (or any) check items as passed/failed/reset |
+| `daihon hook install` | Install a non-blocking git `post-commit` hook for background watching |
+| `daihon fix [--plan-only \| --auto-approve]` | Generate a missing-feature task from the stopped step and run the dev → re-watch loop |
+| `daihon notify test [--dry-run]` | Send a test notification via `ntfy` (or record locally with `--dry-run`) |
+| `daihon init-integration <agy\|codex\|claude> [--no-rules \| --no-hooks]` | Safely install/merge Skills, Always-On rules, and lifecycle hooks |
 
-## 開発・テスト
+## Documentation
+
+- **Japanese README**: [README.ja.md](README.ja.md)
+- **Getting Started & Daily Workflow (JA)**: [docs/getting-started.md](docs/getting-started.md)
+- **Scenario File Format Specification (JA)**: [docs/scenario-format.md](docs/scenario-format.md)
+
+## Development & Tests
+
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings
 ```
