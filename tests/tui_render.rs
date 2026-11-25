@@ -212,3 +212,100 @@ fn tui_displays_drift_badge_and_banner_when_scenario_stagnates() {
     assert!(screen.contains("[DRIFT x3]"), "一覧に [DRIFT x3] が出るべき:\n{screen}");
     assert!(screen.contains("ドリフト検知"), "詳細にドリフト警告が出るべき:\n{screen}");
 }
+
+#[test]
+fn tui_togaki_modal_resolves_parent_and_renders_input_generating_and_preview_states() {
+    use daihon::model::Priority;
+    use daihon::register::{OverlapFinding, PriorityProposal, RegistrationProposal};
+    use daihon::tui::app::{DraftTarget, ModalState};
+
+    let mut app = App::load(Path::new("examples/scenarios")).expect("load sample scenarios");
+
+    // 1. Selected entry 0 is parent `rio-herdr-cross-machine`; pressing `t` targets it.
+    app.open_togaki_modal();
+    match &app.modal {
+        ModalState::Input {
+            target: DraftTarget::Togaki { parent_id, .. },
+            ..
+        } => assert_eq!(parent_id, "rio-herdr-cross-machine"),
+        other => panic!("expected Input modal for parent, got {other:?}"),
+    }
+
+    // Render input modal with Japanese text.
+    if let ModalState::Input { input, .. } = &mut app.modal {
+        input.push_str("遅延が 50ms 以内に収まること");
+    }
+    let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    terminal.draw(|f| render(f, &app)).unwrap();
+    let input_screen = buffer_to_string(&terminal);
+    assert!(input_screen.contains("ト書き（Togaki）を追加"));
+    assert!(input_screen.contains("遅延が 50ms 以内に収まること"));
+
+    // 2. Selecting child Togaki (entry 1) and pressing `t` resolves back to its parent scenario!
+    app.close_modal(None);
+    app.next();
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.id,
+        "rio-herdr-reconnect-latency"
+    );
+    app.open_togaki_modal();
+    match &app.modal {
+        ModalState::Input {
+            target: DraftTarget::Togaki { parent_id, .. },
+            ..
+        } => assert_eq!(parent_id, "rio-herdr-cross-machine"),
+        other => panic!("expected sibling Togaki to attach to same parent, got {other:?}"),
+    }
+
+    // 3. Render Generating spinner modal.
+    app.modal = ModalState::Generating {
+        target: DraftTarget::Togaki {
+            parent_id: "rio-herdr-cross-machine".to_string(),
+            parent_title: "Rio から herdr".to_string(),
+        },
+        input: "遅延が 50ms 以内に収まること".to_string(),
+        tick: 2,
+    };
+    terminal.clear().unwrap();
+    terminal.draw(|f| render(f, &app)).unwrap();
+    let gen_screen = buffer_to_string(&terminal);
+    assert!(gen_screen.contains("ト書き生成中"));
+
+    // 4. Render Preview confirmation modal.
+    let sample_sc = app.selected_scenario().unwrap().scenario.clone();
+    app.modal = ModalState::Preview {
+        target: DraftTarget::Togaki {
+            parent_id: "rio-herdr-cross-machine".to_string(),
+            parent_title: "Rio から herdr".to_string(),
+        },
+        proposal: Box::new(RegistrationProposal {
+            scenario: sample_sc,
+            overlaps: vec![OverlapFinding {
+                existing_id: "rio-herdr-reconnect-latency".to_string(),
+                existing_title: "既存ト書き".to_string(),
+                reason: "遅延チェックが重複".to_string(),
+            }],
+            priority_proposal: PriorityProposal {
+                suggested: Priority::P1,
+                rationale: "品質に直結するため".to_string(),
+            },
+        }),
+        priority: Priority::P0,
+        scroll: 0,
+    };
+    terminal.clear().unwrap();
+    terminal.draw(|f| render(f, &app)).unwrap();
+    let preview_screen = buffer_to_string(&terminal);
+    assert!(
+        preview_screen.contains("ト書きプレビュー確認"),
+        "Preview title missing:\n{preview_screen}"
+    );
+    assert!(
+        preview_screen.contains("重複チェック"),
+        "Overlap missing:\n{preview_screen}"
+    );
+    assert!(
+        preview_screen.contains("[y/Enter] 保存"),
+        "Action bar missing:\n{preview_screen}"
+    );
+}

@@ -50,9 +50,12 @@ daihon init-integration agy           # Or: codex / claude (merges Skill, rules 
 # 1. Register a large E2E milestone scenario in natural language
 daihon register "Open the app on MacBook Air and edit in Blender running on Ubuntu"
 
-# 1b. Attach follow-up requirements / branches ("Togaki") without touching the parent file
-daihon togaki <parent-id> "Keep end-to-end latency under 50ms"
-daihon togaki <parent-id> "Transfer local assets from Air into the open Blender session"
+# 1b. Attach follow-up requirements / branches ("Togaki")—no need to copy parent IDs!
+#     In the TUI: select a scenario and press `t` (or `n` for a new scenario)
+daihon tui
+#     Or from CLI (interactive parent picker when parent ID is omitted):
+daihon togaki "Keep end-to-end latency under 50ms"
+daihon togaki "Transfer local assets from Air into the open Blender session"
 
 # 2. Verify with an independent watcher agent
 daihon watch
@@ -80,11 +83,11 @@ daihon notify test
 | :--- | :--- |
 | `daihon init` | Initialize `.daihon.toml` and `scenarios/` in a repository |
 | `daihon validate [path]` | Validate scenario Markdown/front matter format and status consistency |
-| `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (list, priorities, step checks, `[DRIFT]` alerts) |
+| `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (tree view, `[DRIFT]` alerts, `t` to add Togaki, `n` for new scenario) |
 | `daihon status [--json]` | Print non-interactive scenario status summary and stopped steps |
 | `daihon context` | Output concise current-state / drift brief for coding agent sessions |
 | `daihon register "<text>"` | Turn natural language into a structured E2E scenario with overlap & priority proposals |
-| `daihon togaki <parent-id> "<text>"` | Attach a follow-up requirement or branch (`Togaki`) under an existing parent scenario |
+| `daihon togaki [parent-id] "<text>"` | Attach a follow-up requirement or branch (`Togaki`); omits parent ID to pick interactively |
 | `daihon watch [--if-changed \| --background \| --interval 15m \| --stop \| --daemon-status]` | Run independent watcher verification or manage the background periodic daemon |
 | `daihon check <id> <check-id> --pass` | Mark `[manual]` (or any) check items as passed/failed/reset |
 | `daihon hook install` | Install a non-blocking git `post-commit` hook for background watching |

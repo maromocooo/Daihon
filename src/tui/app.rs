@@ -4,14 +4,44 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::config::DriftConfig;
-use crate::model::scenario::ScenarioStatus;
+use crate::model::scenario::{Priority, ScenarioStatus};
 use crate::model::store::{LoadedScenario, TreeEntry, load_scenarios_tree, order_as_tree};
+use crate::register::RegistrationProposal;
 use crate::watcher::drift::{DriftSummary, analyze_scenario_drift};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     List,
     Detail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftTarget {
+    NewScenario,
+    Togaki {
+        parent_id: String,
+        parent_title: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ModalState {
+    None,
+    Input {
+        target: DraftTarget,
+        input: String,
+    },
+    Generating {
+        target: DraftTarget,
+        input: String,
+        tick: usize,
+    },
+    Preview {
+        target: DraftTarget,
+        proposal: Box<RegistrationProposal>,
+        priority: Priority,
+        scroll: u16,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +62,7 @@ pub struct App {
     pub selected: usize,
     pub detail_scroll: u16,
     pub focus: FocusPane,
+    pub modal: ModalState,
     pub status_message: Option<String>,
 }
 
@@ -56,6 +87,7 @@ impl App {
             selected: 0,
             detail_scroll: 0,
             focus: FocusPane::List,
+            modal: ModalState::None,
             status_message: None,
         })
     }
@@ -73,19 +105,25 @@ impl App {
             selected: 0,
             detail_scroll: 0,
             focus: FocusPane::List,
+            modal: ModalState::None,
             status_message: None,
         }
     }
 
     pub fn reload(&mut self) {
+        self.reload_and_select(None);
+    }
+
+    pub fn reload_and_select(&mut self, select_id: Option<&str>) {
         match load_scenarios_tree(&self.dir) {
             Ok(entries) => {
-                let prev_id = self
-                    .selected_scenario()
-                    .map(|s| s.scenario.front_matter.id.clone());
+                let target_id = select_id.map(ToOwned::to_owned).or_else(|| {
+                    self.selected_scenario()
+                        .map(|s| s.scenario.front_matter.id.clone())
+                });
                 self.drifts = load_drift_map(&entries, &self.state_dir, &self.drift_cfg);
                 self.entries = entries;
-                if let Some(id) = prev_id
+                if let Some(id) = target_id
                     && let Some(pos) = self
                         .entries
                         .iter()
@@ -96,7 +134,9 @@ impl App {
                     self.selected = self.entries.len().saturating_sub(1);
                 }
                 self.detail_scroll = 0;
-                self.status_message = Some(format!("再読込完了 ({} 件)", self.entries.len()));
+                if select_id.is_none() {
+                    self.status_message = Some(format!("再読込完了 ({} 件)", self.entries.len()));
+                }
             }
             Err(err) => {
                 self.status_message = Some(format!("読込エラー: {err}"));
@@ -114,6 +154,57 @@ impl App {
 
     pub fn drift_for(&self, scenario_id: &str) -> Option<&DriftSummary> {
         self.drifts.get(scenario_id)
+    }
+
+    /// Resolves the parent scenario to attach a new Togaki to based on the current selection.
+    /// If a child Togaki is selected, resolves to its parent scenario so users can rapidly add
+    /// multiple sibling Togaki without accidentally nesting deeper.
+    pub fn resolve_togaki_parent(&self) -> Option<(String, String)> {
+        let sc = &self.selected_entry()?.loaded.scenario;
+        if let Some(ref pid) = sc.front_matter.parent
+            && let Some(parent_entry) = self
+                .entries
+                .iter()
+                .find(|e| e.loaded.scenario.front_matter.id == *pid)
+        {
+            return Some((
+                parent_entry.loaded.scenario.front_matter.id.clone(),
+                parent_entry.loaded.scenario.front_matter.title.clone(),
+            ));
+        }
+        Some((
+            sc.front_matter.id.clone(),
+            sc.front_matter.title.clone(),
+        ))
+    }
+
+    pub fn open_togaki_modal(&mut self) {
+        if let Some((parent_id, parent_title)) = self.resolve_togaki_parent() {
+            self.modal = ModalState::Input {
+                target: DraftTarget::Togaki {
+                    parent_id,
+                    parent_title,
+                },
+                input: String::new(),
+            };
+        } else {
+            self.status_message =
+                Some("ト書きを紐づける親シナリオがありません（先に `n` でシナリオを登録してください）".to_string());
+        }
+    }
+
+    pub fn open_new_scenario_modal(&mut self) {
+        self.modal = ModalState::Input {
+            target: DraftTarget::NewScenario,
+            input: String::new(),
+        };
+    }
+
+    pub fn close_modal(&mut self, msg: Option<String>) {
+        self.modal = ModalState::None;
+        if msg.is_some() {
+            self.status_message = msg;
+        }
     }
 
     pub fn children_summary_for(&self, parent_id: &str) -> ChildrenSummary {

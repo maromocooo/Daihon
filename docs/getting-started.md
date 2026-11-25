@@ -72,9 +72,12 @@ daihon init-integration claude  # SKILL.md + /daihon-* + CLAUDE.md ルール + .
 # まず大きな E2E マイルストーン（本筋）を自然言語で登録
 daihon register "MacBook Air でアプリを開いて Ubuntu 端末の Blender を開き編集作業が行える"
 
-# 本筋にぶら下げる品質条件や派生機能を「ト書き（Togaki）」として追加（親ファイルは壊れません）
-daihon togaki <parent-id> "遅延が 50ms 以内に収まること"
-daihon togaki <parent-id> "Air のストレージにある素材を開いている Blender に引き渡せること"
+# TUI を開いて親シナリオ上で `t` キーを押すだけでト書き追加（`n` キーで新規シナリオ追加）
+daihon tui
+
+# CLI から追加するときも親 ID のコピペは不要（省略すると番号で親を選べます）
+daihon togaki "遅延が 50ms 以内に収まること"
+daihon togaki "Air のストレージにある素材を開いている Blender に引き渡せること"
 ```
 - 親シナリオが未通過の間、子ト書きは **`[親待]`** として自動スキップされ、開発役・見張り役ともに本筋の開通に集中します。
 - 親シナリオが通過した直後から、ぶら下がっているト書きが自動的に見張り・開発ループの対象になり、ト書きが全通したタイミングでも `ntfy` 通知が届きます。

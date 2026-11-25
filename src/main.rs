@@ -130,12 +130,19 @@ enum Commands {
     },
 
     /// 既存シナリオへ枝葉の条件・派生ユースケースを「ト書き（Togaki）」として追加する
+    ///
+    /// 親シナリオ ID を省略して `daihon togaki "遅延が 50ms 以内"` や `daihon togaki` だけで呼ぶと、
+    /// 登録済みシナリオから番号で親を選べます（TUI 内の `t` キーからも追加可能）。
     Togaki {
-        /// 紐づけ先の親シナリオ ID（例: seguito-ubuntu-blender）
-        parent_id: String,
+        /// 親シナリオ ID、または親省略時のト書き説明テキスト
+        first: Option<String>,
 
-        /// 追加したい条件や派生ユースケースの自然言語説明
-        text: Option<String>,
+        /// 第1引数に親シナリオ ID を指定した場合のト書き説明テキスト
+        second: Option<String>,
+
+        /// 親シナリオ ID を明示指定（省略時は対話選択）
+        #[arg(long)]
+        parent: Option<String>,
 
         /// 親シナリオの特定ステップに紐づける（任意）
         #[arg(long)]
@@ -435,8 +442,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
         Commands::Tui { dir } => {
             let scenarios_dir = config.resolve_scenarios_dir(&workdir, dir.as_deref());
-            let state_dir = config.resolve_state_dir(&workdir);
-            run_tui(&scenarios_dir, &state_dir, config.drift.clone())?;
+            run_tui(&workdir, &scenarios_dir, &config)?;
             Ok(ExitCode::SUCCESS)
         }
 
@@ -487,8 +493,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Commands::Togaki {
-            parent_id,
-            text,
+            first,
+            second,
+            parent,
             attach_step,
             dir,
             agent,
@@ -497,13 +504,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
         } => {
             let scenarios_dir = config.resolve_scenarios_dir(&workdir, dir.as_deref());
+            let (resolved_parent, resolved_text) =
+                resolve_togaki_cli_args(&scenarios_dir, parent, first, second)?;
             cmd_register_or_togaki(
                 &workdir,
                 &config,
                 &scenarios_dir,
-                Some(&parent_id),
+                Some(&resolved_parent),
                 attach_step,
-                text,
+                resolved_text,
                 agent,
                 priority,
                 yes,
@@ -1241,6 +1250,96 @@ fn run_watch_once(
     Ok(all_passed)
 }
 
+fn resolve_togaki_cli_args(
+    scenarios_dir: &Path,
+    explicit_parent: Option<String>,
+    first: Option<String>,
+    second: Option<String>,
+) -> Result<(String, Option<String>)> {
+    if let Some(pid) = explicit_parent {
+        return Ok((pid, first.or(second)));
+    }
+
+    match (first, second) {
+        (Some(parent_id), Some(text)) => Ok((parent_id, Some(text))),
+        (Some(arg), None) => {
+            let loaded = load_scenarios_from_dir(scenarios_dir)?;
+            if loaded.iter().any(|s| s.scenario.front_matter.id == arg) {
+                Ok((arg, None))
+            } else {
+                // Single argument did not match an existing scenario ID -> treat as natural language text
+                // and let the user pick the parent scenario interactively.
+                let parent_id = pick_parent_scenario_interactively(&loaded)?;
+                Ok((parent_id, Some(arg)))
+            }
+        }
+        (None, Some(text)) => {
+            let loaded = load_scenarios_from_dir(scenarios_dir)?;
+            let parent_id = pick_parent_scenario_interactively(&loaded)?;
+            Ok((parent_id, Some(text)))
+        }
+        (None, None) => {
+            let loaded = load_scenarios_from_dir(scenarios_dir)?;
+            let parent_id = pick_parent_scenario_interactively(&loaded)?;
+            Ok((parent_id, None))
+        }
+    }
+}
+
+fn pick_parent_scenario_interactively(loaded: &[daihon::model::LoadedScenario]) -> Result<String> {
+    if loaded.is_empty() {
+        bail!("親にできるシナリオがまだありません。先に `daihon register` でシナリオを登録してください");
+    }
+
+    // Prefer root scenarios as candidates; fall back to all entries if needed.
+    let candidates: Vec<_> = loaded
+        .iter()
+        .filter(|s| !s.scenario.is_togaki())
+        .collect();
+    let list = if candidates.is_empty() {
+        loaded.iter().collect::<Vec<_>>()
+    } else {
+        candidates
+    };
+
+    if list.len() == 1 {
+        let only = &list[0].scenario;
+        println!(
+            "親シナリオを自動選択しました: [{}] {} ({})",
+            only.front_matter.priority, only.front_matter.title, only.front_matter.id
+        );
+        return Ok(only.front_matter.id.clone());
+    }
+
+    println!("ト書きを追加する親シナリオを選んでください:");
+    for (idx, item) in list.iter().enumerate() {
+        let sc = &item.scenario;
+        println!(
+            "  {}) [{}] {} — {}",
+            idx + 1,
+            sc.front_matter.priority,
+            sc.front_matter.id,
+            sc.front_matter.title
+        );
+    }
+    print!("番号を入力 [1-{}] (既定: 1): ", list.len());
+    io::stdout().flush()?;
+
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(list[0].scenario.front_matter.id.clone());
+    }
+    let choice: usize = trimmed
+        .parse()
+        .with_context(|| format!("1〜{} の番号を入力してください（入力: '{trimmed}'）", list.len()))?;
+    if choice == 0 || choice > list.len() {
+        bail!("1〜{} の範囲で番号を指定してください", list.len());
+    }
+    Ok(list[choice - 1].scenario.front_matter.id.clone())
+}
+
 fn read_register_input(text_arg: Option<String>, is_togaki: bool) -> Result<String> {
     if let Some(t) = text_arg {
         return Ok(t);
@@ -1298,4 +1397,71 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     io::stdin().read_line(&mut input)?;
     let trimmed = input.trim();
     Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_togaki_cli_args_handles_explicit_two_arg_id_match_and_auto_select() {
+        let dir = TempDir::new().unwrap();
+        let scenarios_dir = dir.path().join("scenarios");
+        fs::create_dir_all(&scenarios_dir).unwrap();
+        fs::copy(
+            "examples/scenarios/01-rio-herdr-cross-machine.md",
+            scenarios_dir.join("01-rio-herdr-cross-machine.md"),
+        )
+        .unwrap();
+        fs::copy(
+            "examples/scenarios/03-rio-herdr-reconnect-latency.md",
+            scenarios_dir.join("03-rio-herdr-reconnect-latency.md"),
+        )
+        .unwrap();
+
+        // 1. Explicit --parent + text
+        let (pid, txt) = resolve_togaki_cli_args(
+            &scenarios_dir,
+            Some("custom-parent".into()),
+            Some("遅延 50ms 以内".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pid, "custom-parent");
+        assert_eq!(txt.as_deref(), Some("遅延 50ms 以内"));
+
+        // 2. Two positional args: <parent-id> <text>
+        let (pid, txt) = resolve_togaki_cli_args(
+            &scenarios_dir,
+            None,
+            Some("rio-herdr-cross-machine".into()),
+            Some("素材引き渡し".into()),
+        )
+        .unwrap();
+        assert_eq!(pid, "rio-herdr-cross-machine");
+        assert_eq!(txt.as_deref(), Some("素材引き渡し"));
+
+        // 3. One arg matching an existing ID -> treated as parent_id, text None
+        let (pid, txt) = resolve_togaki_cli_args(
+            &scenarios_dir,
+            None,
+            Some("rio-herdr-cross-machine".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pid, "rio-herdr-cross-machine");
+        assert_eq!(txt, None);
+
+        // 4. One natural-language arg -> auto-selects the single root scenario (ignoring child Togaki)
+        let (pid, txt) = resolve_togaki_cli_args(
+            &scenarios_dir,
+            None,
+            Some("遅延が 50ms 以内に収まること".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pid, "rio-herdr-cross-machine");
+        assert_eq!(txt.as_deref(), Some("遅延が 50ms 以内に収まること"));
+    }
 }
