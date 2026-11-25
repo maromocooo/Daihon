@@ -168,6 +168,75 @@ fn tui_renders_repository_sample_scenarios() {
 }
 
 #[test]
+fn tui_wraps_long_titles_and_cjk_detail_without_clipping_on_narrow_window() {
+    let mut app = App::load(Path::new("examples/scenarios")).expect("load sample scenarios");
+    // Select the 3rd item (sample-project-workflow) on a narrow 84x30 window (similar to user screenshot).
+    app.next();
+    app.next();
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.id,
+        "sample-project-workflow"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(84, 30)).unwrap();
+    terminal.draw(|f| render(f, &app)).unwrap();
+
+    let screen = buffer_to_string(&terminal);
+    // Split rendered screen lines into left pane (before the 2nd `│` separator) and right pane.
+    let mut left_compact = String::new();
+    let mut right_compact = String::new();
+    for row in screen.lines().take(29) {
+        let parts: Vec<&str> = row.split('│').collect();
+        if parts.len() >= 4 {
+            for ch in parts[1].chars() {
+                if !matches!(ch, ' ' | '─' | '┌' | '┐' | '└' | '┘') {
+                    left_compact.push(ch);
+                }
+            }
+            for ch in parts[3].chars() {
+                if !matches!(ch, ' ' | '─' | '┌' | '┐' | '└' | '┘') {
+                    right_compact.push(ch);
+                }
+            }
+        }
+    }
+
+    // Left pane must wrap full titles instead of clipping at right edge!
+    assert!(
+        left_compact.contains("Rioからherdrを使い、MacStudioとUbuntuをまたいで開発を続ける"),
+        "左ペインの1件目タイトル全文が見切れずに表示されるべき:\n{screen}"
+    );
+    assert!(
+        left_compact.contains("再接続とホスト切替の遅延が500ms以内に収まる"),
+        "左ペインのト書きタイトル全文が見切れずに表示されるべき:\n{screen}"
+    );
+    assert!(
+        left_compact.contains("試験台CLIでセッション作成・引き継ぎ・再開の一連の流れが通る"),
+        "左ペインの3件目タイトル全文が見切れずに表示されるべき:\n{screen}"
+    );
+
+    // Right pane Detail must show short non-clipped border title, full wrapped body title,
+    // AND never drop CJK characters around inline backticks!
+    assert!(
+        screen.contains("[P1] Detail"),
+        "右ペイン枠タイトルが簡潔で切れずに表示されるべき:\n{screen}"
+    );
+    assert!(
+        right_compact.contains("試験台CLIでセッション作成・引き継ぎ・再開の一連の流れが通る"),
+        "右ペイン詳細の先頭にシナリオタイトル全文が表示されるべき:\n{screen}"
+    );
+    assert!(
+        right_compact.contains("3つのステップすべてをローカルコマンドで自動検証（`auto`）できるようにし、"),
+        "右ペイン概要の CJK 折り返しで文字欠けが起きないべき:\n{screen}"
+    );
+    // Compact footer fits completely on 84 cols without cutting off `q:終了`!
+    assert!(
+        screen.contains("q:終了"),
+        "狭い画面でもフッター末尾まで切れずに表示されるべき:\n{screen}"
+    );
+}
+
+#[test]
 fn tui_priority_change_updates_markdown_surgically_and_resorts_tree() {
     use daihon::model::Priority;
 

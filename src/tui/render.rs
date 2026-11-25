@@ -58,6 +58,9 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let inner_width = block.inner(area).width as usize;
+    let avail_width = inner_width.saturating_sub(2).max(8);
+
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -88,7 +91,7 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                 .count();
             let total_steps = sc.steps.len();
 
-            let mut spans = Vec::new();
+            let mut header_spans = Vec::new();
             if entry.depth > 0 {
                 let indent = "  ".repeat(entry.depth - 1);
                 let branch = if entry.is_last_sibling {
@@ -96,22 +99,22 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     "├─ "
                 };
-                spans.push(Span::styled(
+                header_spans.push(Span::styled(
                     format!("{indent}{branch}"),
                     Style::default().fg(muted_color),
                 ));
             }
-            spans.push(Span::styled(
+            header_spans.push(Span::styled(
                 format!("[{badge}]"),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw(format!(" {} ", sc.front_matter.priority)));
-            spans.push(Span::styled(
+            header_spans.push(Span::raw(format!(" {} ", sc.front_matter.priority)));
+            header_spans.push(Span::styled(
                 format!("{passed_steps}/{total_steps} "),
                 Style::default().fg(muted_color),
             ));
             if sc.is_togaki() {
-                spans.push(Span::styled(
+                header_spans.push(Span::styled(
                     "[ト書き] ",
                     Style::default().fg(Color::Yellow),
                 ));
@@ -120,15 +123,38 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                 && let Some(drift) = app.drift_for(&sc.front_matter.id)
                 && drift.is_drifting
             {
-                spans.push(Span::styled(
+                header_spans.push(Span::styled(
                     format!("[DRIFT x{}] ", drift.consecutive_same_stop),
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            spans.push(Span::raw(sc.front_matter.title.clone()));
-            ListItem::new(Line::from(spans))
+
+            let header_line = Line::from(header_spans.clone());
+            let title_text = sc.front_matter.title.clone();
+            let title_width = Span::raw(title_text.as_str()).width();
+
+            if header_line.width() + title_width <= avail_width {
+                header_spans.push(Span::raw(title_text));
+                ListItem::new(Line::from(header_spans))
+            } else {
+                let mut item_lines = wrap_styled_line(header_line, avail_width, "");
+                let title_indent = if entry.depth > 0 {
+                    format!("{}   ", "  ".repeat(entry.depth - 1))
+                } else {
+                    "  ".to_string()
+                };
+                let effective_indent = if Span::raw(title_indent.as_str()).width() + 8 <= avail_width
+                {
+                    title_indent
+                } else {
+                    String::new()
+                };
+                let title_line = Line::from(Span::raw(format!("{effective_indent}{title_text}")));
+                item_lines.extend(wrap_styled_line(title_line, avail_width, &effective_indent));
+                ListItem::new(item_lines)
+            }
         })
         .collect();
 
@@ -168,24 +194,22 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let sc = &entry.loaded.scenario;
     let kind_prefix = if sc.is_togaki() { "[ト書き] " } else { "" };
-    let title = format!(
-        " {kind_prefix}[{}] {} ",
-        sc.front_matter.priority, sc.front_matter.title
-    );
+    let title = format!(" {kind_prefix}[{}] Detail ", sc.front_matter.priority);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
 
+    let inner_width = block.inner(area).width as usize;
     let children_summary = app.children_summary_for(&sc.front_matter.id);
-    let lines = build_detail_lines(
+    let raw_lines = build_detail_lines(
         entry,
         app.drift_for(&sc.front_matter.id),
         &children_summary,
     );
-    let detail = Paragraph::new(lines)
+    let wrapped_lines = wrap_lines_for_width(raw_lines, inner_width);
+    let detail = Paragraph::new(wrapped_lines)
         .block(block)
-        .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
 
     frame.render_widget(detail, area);
@@ -199,6 +223,14 @@ fn build_detail_lines(
     let sc: &Scenario = &entry.loaded.scenario;
     let mut lines = Vec::new();
     let (badge, color) = scenario_badge(sc.front_matter.status);
+
+    lines.push(Line::from(Span::styled(
+        sc.front_matter.title.clone(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
 
     let checked_info = match (
         sc.front_matter.last_checked_at.as_deref(),
@@ -216,7 +248,10 @@ fn build_detail_lines(
             format!("[{badge}] {}", sc.front_matter.status),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("   ID: {}", sc.front_matter.id)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(sc.front_matter.id.clone()),
     ]));
 
     if sc.is_togaki() {
@@ -363,19 +398,24 @@ fn build_detail_lines(
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let narrow = area.width < 96;
     let help = match &app.modal {
+        ModalState::None if narrow => {
+            "j/k:移動 0-3:優先度 t:ト書き n:新規 Tab:切替 r:再読込 q:終了"
+        }
         ModalState::None => {
             "↑/↓(j/k): 選択  0-3: 優先度  t: ト書き追加  n: 新規シナリオ  Tab: ペイン切替  r: 再読込  q: 終了"
         }
         ModalState::Input { .. } => "自然言語で入力  Enter: 生成  Esc: キャンセル",
         ModalState::Generating { .. } => "登録エージェントで構造化中...  Esc: キャンセル",
+        ModalState::Preview { .. } if narrow => "y/Enter:保存 0-3:P0-P3 j/k:移動 n/Esc:戻",
         ModalState::Preview { .. } => {
             "y/Enter: 保存  0-3: 優先度変更(P0..P3)  ↑/↓(j/k): スクロール  n/Esc: キャンセル"
         }
     };
     let text = match (&app.modal, &app.status_message) {
         (ModalState::None, Some(msg)) => format!("{help}  |  {msg}"),
-        (ModalState::None, None) => format!("{help}  |  dir: {}", app.dir.display()),
+        (ModalState::None, None) if !narrow => format!("{help}  |  dir: {}", app.dir.display()),
         _ => help.to_string(),
     };
     let footer = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
@@ -594,10 +634,9 @@ fn render_modal(frame: &mut Frame, app: &App, body_area: Rect) {
                 lines.push(Line::raw(md_line.to_string()));
             }
 
+            let wrapped = wrap_lines_for_width(lines, chunks[0].width as usize);
             frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll((*scroll, 0)),
+                Paragraph::new(wrapped).scroll((*scroll, 0)),
                 chunks[0],
             );
             frame.render_widget(
@@ -611,6 +650,171 @@ fn render_modal(frame: &mut Frame, app: &App, body_area: Rect) {
             );
         }
     }
+}
+
+fn char_display_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    let s: &str = ch.encode_utf8(&mut buf);
+    Span::raw(s).width()
+}
+
+/// Splits a string into wrappable tokens:
+/// - Contiguous ASCII graphic runs (words/numbers/flags like `Studio`, `500ms`, `--target`) stay intact when they fit.
+/// - Non-ASCII characters (Japanese/CJK) wrap cleanly character-by-character.
+/// - Spaces and `\n` are emitted as individual tokens.
+fn tokenize_for_wrap(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch.is_ascii_graphic() {
+            let mut end = start + ch.len_utf8();
+            while let Some(&(next_idx, next_ch)) = chars.peek() {
+                if next_ch.is_ascii_graphic() {
+                    end = next_idx + next_ch.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(&text[start..end]);
+        } else {
+            tokens.push(&text[start..start + ch.len_utf8()]);
+        }
+    }
+    tokens
+}
+
+/// Lossless, Unicode-display-width-aware styled line wrapper.
+/// Keeps ASCII words/numbers together when possible while wrapping CJK smoothly without
+/// ratatui's WordWrapper character-dropping bugs.
+fn wrap_styled_line(
+    line: Line<'static>,
+    max_width: usize,
+    continuation_indent: &str,
+) -> Vec<Line<'static>> {
+    let max_width = max_width.max(4);
+    let indent_width = Span::raw(continuation_indent).width();
+    let effective_indent = if !continuation_indent.is_empty() && indent_width + 4 <= max_width {
+        continuation_indent
+    } else {
+        ""
+    };
+    let effective_indent_width = Span::raw(effective_indent).width();
+    let continuation_capacity = max_width.saturating_sub(effective_indent_width).max(4);
+
+    if line.spans.is_empty() {
+        return vec![Line::raw("")];
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width: usize = 0;
+
+    let push_wrapped_line = |out: &mut Vec<Line<'static>>,
+                             current_spans: &mut Vec<Span<'static>>,
+                             current_width: &mut usize| {
+        out.push(Line::from(std::mem::take(current_spans)));
+        if !effective_indent.is_empty() {
+            current_spans.push(Span::raw(effective_indent.to_string()));
+            *current_width = effective_indent_width;
+        } else {
+            *current_width = 0;
+        }
+    };
+
+    for span in line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for token in tokenize_for_wrap(&span.content) {
+            if token == "\n" {
+                if !buf.is_empty() {
+                    current_spans.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                out.push(Line::from(std::mem::take(&mut current_spans)));
+                current_width = 0;
+                continue;
+            }
+
+            let tok_width = Span::raw(token).width();
+            let line_has_content = if out.is_empty() {
+                current_width > 0
+            } else {
+                current_width > effective_indent_width
+            };
+
+            if line_has_content && current_width + tok_width > max_width {
+                if token == " " {
+                    if !buf.is_empty() {
+                        current_spans.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    push_wrapped_line(&mut out, &mut current_spans, &mut current_width);
+                    continue;
+                }
+                if tok_width <= continuation_capacity {
+                    if !buf.is_empty() {
+                        current_spans.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    push_wrapped_line(&mut out, &mut current_spans, &mut current_width);
+                    buf.push_str(token);
+                    current_width += tok_width;
+                    continue;
+                }
+            }
+
+            if current_width + tok_width <= max_width {
+                buf.push_str(token);
+                current_width += tok_width;
+            } else {
+                // Token itself is wider than a single line: fall back to char-by-char wrapping.
+                for ch in token.chars() {
+                    let w = char_display_width(ch);
+                    if current_width > 0 && current_width + w > max_width {
+                        if !buf.is_empty() {
+                            current_spans.push(Span::styled(std::mem::take(&mut buf), style));
+                        }
+                        push_wrapped_line(&mut out, &mut current_spans, &mut current_width);
+                    }
+                    buf.push(ch);
+                    current_width += w;
+                }
+            }
+        }
+        if !buf.is_empty() {
+            current_spans.push(Span::styled(buf, style));
+        }
+    }
+
+    if !current_spans.is_empty() || out.is_empty() {
+        out.push(Line::from(current_spans));
+    }
+
+    out
+}
+
+fn wrap_lines_for_width(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    let max_width = max_width.max(4);
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let first_text = line
+            .spans
+            .first()
+            .map(|s| s.content.as_ref())
+            .unwrap_or("");
+        let second_text = line
+            .spans
+            .get(1)
+            .map(|s| s.content.as_ref())
+            .unwrap_or("");
+        let continuation = if first_text.starts_with("      └─ ") {
+            "         "
+        } else if first_text == "  " && second_text.starts_with('[') {
+            "      "
+        } else {
+            ""
+        };
+        out.extend(wrap_styled_line(line, max_width, continuation));
+    }
+    out
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
