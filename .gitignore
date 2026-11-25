@@ -1,0 +1,10 @@
+/target
+.daihon/
+.handoff/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.env
+.env.*
+**/*.rs.bk
+.DS_Store

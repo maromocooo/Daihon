@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""試験台ミニ CLI（段階4・5 検証用）.
+
+初期状態では Step 2 の `handoff` サブコマンドを意図的に未実装にしてあります。
+見張り役が Step 1 を通し Step 2 で停止すること、さらに `handoff` を足すと
+全ステップ通過することをテストするために使います。
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SAMPLE_CLI_HOME", ".sample-cli-state"))
+
+
+def session_file(name: str) -> Path:
+    return STATE_DIR / f"{name}.json"
+
+
+def cmd_init(args: list[str]) -> int:
+    if len(args) != 1:
+        print("usage: sample-cli init <name>", file=sys.stderr)
+        return 2
+    name = args[0]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"name": name, "target": "local", "status": "initialized"}
+    session_file(name).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"initialized session: {name}")
+    return 0
+
+
+def cmd_list(_args: list[str]) -> int:
+    if not STATE_DIR.exists():
+        return 0
+    for path in sorted(STATE_DIR.glob("*.json")):
+        print(path.stem)
+    return 0
+
+
+def cmd_status(args: list[str]) -> int:
+    if len(args) != 1:
+        print("usage: sample-cli status <name>", file=sys.stderr)
+        return 2
+    path = session_file(args[0])
+    if not path.exists():
+        print(f"session not found: {args[0]}", file=sys.stderr)
+        return 1
+    data = json.loads(path.read_text(encoding="utf-8"))
+    print(f"name: {data['name']}")
+    print(f"target: {data['target']}")
+    print(f"status: {data['status']}")
+    return 0
+
+
+def cmd_resume(args: list[str]) -> int:
+    if len(args) != 1:
+        print("usage: sample-cli resume <name>", file=sys.stderr)
+        return 2
+    path = session_file(args[0])
+    if not path.exists():
+        print(f"session not found: {args[0]}", file=sys.stderr)
+        return 1
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["status"] = "resumed"
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"resumed {data['name']} on target: {data['target']}")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: sample-cli <init|list|status|resume> ...", file=sys.stderr)
+        return 2
+    sub = sys.argv[1]
+    rest = sys.argv[2:]
+    if sub == "init":
+        return cmd_init(rest)
+    if sub == "list":
+        return cmd_list(rest)
+    if sub == "status":
+        return cmd_status(rest)
+    if sub == "resume":
+        return cmd_resume(rest)
+    print(f"error: unknown command '{sub}'", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
