@@ -37,14 +37,21 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let (scenario_count, togaki_count) = app.counts();
+    let list_title = if togaki_count > 0 {
+        format!(" Scenarios ({scenario_count}) / Togaki ({togaki_count}) ")
+    } else {
+        format!(" Scenarios ({scenario_count}) ")
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(format!(" Scenarios ({}) ", app.entries.len()));
+        .title(list_title);
 
     if app.entries.is_empty() {
         let empty =
-            Paragraph::new("シナリオがありません。\n`daihon register` で登録してください。")
+            Paragraph::new("シナリオがありません。\n`daihon register` または `n` キーで登録してください。")
                 .block(block)
                 .wrap(Wrap { trim: true });
         frame.render_widget(empty, area);
@@ -54,12 +61,25 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(idx, entry)| {
+            let is_selected = idx == app.selected;
+            let muted_color = if is_selected {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            };
+
             let sc = &entry.loaded.scenario;
-            let (badge, color) = if entry.blocked_by_parent.is_some() {
+            let (badge, raw_color) = if entry.blocked_by_parent.is_some() {
                 ("親待", Color::DarkGray)
             } else {
                 scenario_badge(sc.front_matter.status)
+            };
+            let color = if raw_color == Color::DarkGray && is_selected {
+                Color::Gray
+            } else {
+                raw_color
             };
             let passed_steps = sc
                 .steps
@@ -78,7 +98,7 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                 };
                 spans.push(Span::styled(
                     format!("{indent}{branch}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(muted_color),
                 ));
             }
             spans.push(Span::styled(
@@ -88,7 +108,7 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::raw(format!(" {} ", sc.front_matter.priority)));
             spans.push(Span::styled(
                 format!("{passed_steps}/{total_steps} "),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(muted_color),
             ));
             if sc.is_togaki() {
                 spans.push(Span::styled(
@@ -345,7 +365,7 @@ fn build_detail_lines(
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = match &app.modal {
         ModalState::None => {
-            "↑/↓(j/k): 選択  t: ト書き追加  n: 新規シナリオ  Tab: ペイン切替  r: 再読込  q: 終了"
+            "↑/↓(j/k): 選択  0-3: 優先度  t: ト書き追加  n: 新規シナリオ  Tab: ペイン切替  r: 再読込  q: 終了"
         }
         ModalState::Input { .. } => "自然言語で入力  Enter: 生成  Esc: キャンセル",
         ModalState::Generating { .. } => "登録エージェントで構造化中...  Esc: キャンセル",

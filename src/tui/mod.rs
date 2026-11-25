@@ -112,6 +112,10 @@ pub fn run_tui(workdir: &Path, scenarios_dir: &Path, config: &HarnessConfig) -> 
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Tab => app.toggle_focus(),
                             KeyCode::Char('r') => app.reload(),
+                            KeyCode::Char('0') => app.set_selected_priority(Priority::P0),
+                            KeyCode::Char('1') => app.set_selected_priority(Priority::P1),
+                            KeyCode::Char('2') => app.set_selected_priority(Priority::P2),
+                            KeyCode::Char('3') => app.set_selected_priority(Priority::P3),
                             KeyCode::Char('t') => app.open_togaki_modal(),
                             KeyCode::Char('n') => app.open_new_scenario_modal(),
                             _ => {}

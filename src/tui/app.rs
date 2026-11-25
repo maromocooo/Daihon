@@ -5,7 +5,9 @@ use anyhow::Result;
 
 use crate::config::DriftConfig;
 use crate::model::scenario::{Priority, ScenarioStatus};
-use crate::model::store::{LoadedScenario, TreeEntry, load_scenarios_tree, order_as_tree};
+use crate::model::store::{
+    LoadedScenario, TreeEntry, load_scenarios_tree, order_as_tree, save_updated_scenario,
+};
 use crate::register::RegistrationProposal;
 use crate::watcher::drift::{DriftSummary, analyze_scenario_drift};
 
@@ -135,11 +137,51 @@ impl App {
                 }
                 self.detail_scroll = 0;
                 if select_id.is_none() {
-                    self.status_message = Some(format!("再読込完了 ({} 件)", self.entries.len()));
+                    let (scenarios, togakis) = self.counts();
+                    self.status_message = if togakis > 0 {
+                        Some(format!(
+                            "再読込完了 (シナリオ {scenarios} / ト書き {togakis})"
+                        ))
+                    } else {
+                        Some(format!("再読込完了 (シナリオ {scenarios})"))
+                    };
                 }
             }
             Err(err) => {
                 self.status_message = Some(format!("読込エラー: {err}"));
+            }
+        }
+    }
+
+    /// Returns `(root_scenario_count, togaki_count)`.
+    pub fn counts(&self) -> (usize, usize) {
+        let togaki = self
+            .entries
+            .iter()
+            .filter(|e| e.loaded.scenario.is_togaki())
+            .count();
+        (self.entries.len().saturating_sub(togaki), togaki)
+    }
+
+    /// Surgically updates the selected scenario/Togaki's priority on disk and re-sorts the tree.
+    pub fn set_selected_priority(&mut self, new_priority: Priority) {
+        let Some(selected) = self.selected_scenario().cloned() else {
+            return;
+        };
+        let id = selected.scenario.front_matter.id.clone();
+        if selected.scenario.front_matter.priority == new_priority {
+            self.status_message = Some(format!("{id} はすでに {new_priority} です"));
+            return;
+        }
+        let mut updated = selected.scenario;
+        updated.front_matter.priority = new_priority;
+        match save_updated_scenario(&selected.path, &updated) {
+            Ok(()) => {
+                self.reload_and_select(Some(&id));
+                self.status_message = Some(format!("優先度を変更しました: {id} -> {new_priority}"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("優先度変更エラー: {err}"));
             }
         }
     }

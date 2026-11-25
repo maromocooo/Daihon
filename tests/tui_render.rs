@@ -127,6 +127,8 @@ status: pending
     terminal.draw(|f| render(f, &app)).unwrap();
 
     let screen = buffer_to_string(&terminal);
+    assert!(screen.contains("Scenarios (4)"), "ト書き0件時は Scenarios (4) のみ:\n{screen}");
+    assert!(!screen.contains("Togaki ("), "ト書き0件時に Togaki 件数は出ないべき:\n{screen}");
     assert!(screen.contains("[FAIL]"), "FAIL バッジが表示されるべき:\n{screen}");
     assert!(screen.contains("[PASS]"), "PASS バッジが表示されるべき:\n{screen}");
     assert!(screen.contains("[WAIT]"), "WAIT バッジが表示されるべき:\n{screen}");
@@ -156,10 +158,108 @@ fn tui_renders_repository_sample_scenarios() {
     terminal.draw(|f| render(f, &app)).unwrap();
 
     let screen = buffer_to_string(&terminal);
-    assert!(screen.contains("Scenarios (3)"));
+    assert!(
+        screen.contains("Scenarios (2) / Togaki (1)"),
+        "本筋シナリオ数とト書き数が分かれて表示されるべき:\n{screen}"
+    );
     assert!(screen.contains("rio-herdr-cross-machine"));
     assert!(screen.contains("Step 2 [FAIL]"));
     assert!(screen.contains("[ト書き]"));
+}
+
+#[test]
+fn tui_priority_change_updates_markdown_surgically_and_resorts_tree() {
+    use daihon::model::Priority;
+
+    let dir = TempDir::new().unwrap();
+    let sc1 = dir.path().join("01-first.md");
+    let sc2 = dir.path().join("02-second.md");
+
+    fs::write(
+        &sc1,
+        r#"---
+id: first-scenario
+title: 最初のシナリオ
+priority: P1
+status: pending
+custom_note: keep-me
+---
+
+## 概要
+ここだけは絶対に書き換えないでほしい概要。
+
+## ステップ
+
+### Step 1: 確認
+- status: pending
+
+- [ ] [auto] s1-c1: 動くこと
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        &sc2,
+        r#"---
+id: second-scenario
+title: 二番目のシナリオ
+priority: P2
+status: pending
+---
+
+## 概要
+二番目の概要。
+
+## ステップ
+
+### Step 1: 確認
+- status: pending
+
+- [ ] [auto] s1-c1: 動くこと
+"#,
+    )
+    .unwrap();
+
+    let mut app = App::load(dir.path()).unwrap();
+    // Move selection to `second-scenario` (index 1, P2) and promote it to P0.
+    app.next();
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.id,
+        "second-scenario"
+    );
+
+    app.set_selected_priority(Priority::P0);
+
+    // It should re-sort to index 0 and keep selection on `second-scenario`.
+    assert_eq!(app.selected, 0);
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.id,
+        "second-scenario"
+    );
+    assert_eq!(
+        app.selected_scenario()
+            .unwrap()
+            .scenario
+            .front_matter
+            .priority,
+        Priority::P0
+    );
+
+    // Now demote `first-scenario` to P3 and confirm surgical preservation of `custom_note` & overview.
+    app.next();
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.id,
+        "first-scenario"
+    );
+    app.set_selected_priority(Priority::P3);
+
+    let saved = fs::read_to_string(&sc1).unwrap();
+    assert!(saved.contains("priority: P3"), "priority が更新されるべき:\n{saved}");
+    assert!(saved.contains("custom_note: keep-me"), "未知キーが保持されるべき:\n{saved}");
+    assert!(
+        saved.contains("ここだけは絶対に書き換えないでほしい概要。"),
+        "概要が保持されるべき:\n{saved}"
+    );
 }
 
 #[test]

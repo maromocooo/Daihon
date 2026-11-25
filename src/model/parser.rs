@@ -812,7 +812,8 @@ pub fn update_scenario_markdown(scenario: &Scenario) -> String {
 }
 
 fn update_front_matter_lines(raw_fm: &str, fm: &FrontMatter) -> String {
-    let updates: [(&str, String); 4] = [
+    let updates: [(&str, String); 5] = [
+        ("priority", fm.priority.to_string()),
         ("status", fm.status.to_string()),
         (
             "last_checked_at",
@@ -828,7 +829,7 @@ fn update_front_matter_lines(raw_fm: &str, fm: &FrontMatter) -> String {
         ),
     ];
 
-    let mut seen = [false; 4];
+    let mut seen = [false; 5];
     let mut lines: Vec<String> = Vec::new();
 
     for line in raw_fm.lines() {
@@ -848,7 +849,7 @@ fn update_front_matter_lines(raw_fm: &str, fm: &FrontMatter) -> String {
     }
 
     for (idx, (key, value)) in updates.iter().enumerate() {
-        if !seen[idx] && (*key == "status" || value != "null") {
+        if !seen[idx] && (*key == "priority" || *key == "status" || value != "null") {
             lines.push(format!("{key}: {value}"));
         }
     }

@@ -72,7 +72,7 @@ daihon init-integration claude  # SKILL.md + /daihon-* + CLAUDE.md ルール + .
 # まず大きな E2E マイルストーン（本筋）を自然言語で登録
 daihon register "MacBook Air でアプリを開いて Ubuntu 端末の Blender を開き編集作業が行える"
 
-# TUI を開いて親シナリオ上で `t` キーを押すだけでト書き追加（`n` キーで新規シナリオ追加）
+# TUI を開いて親シナリオ上で `t` キーを押すだけでト書き追加（`n` キーで新規シナリオ、`0`〜`3` キーで優先度 P0〜P3 を即時変更）
 daihon tui
 
 # CLI から追加するときも親 ID のコピペは不要（省略すると番号で親を選べます）
