@@ -27,7 +27,50 @@ pub struct DriftSummary {
     pub code_changes_without_progress: usize,
     pub stopped_step: usize,
     pub stopped_check: String,
+    #[serde(default)]
+    pub reason_changed: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchAbortRecord {
+    pub scenario_id: String,
+    pub watcher_agent: String,
+    pub failed_at: String,
+    pub is_rate_limit: bool,
+    pub error: String,
+}
+
+pub fn record_watch_abort(
+    state_dir: &Path,
+    scenario_id: &str,
+    watcher_agent: &str,
+    is_rate_limit: bool,
+    error: &str,
+) -> Result<PathBuf> {
+    let aborts_dir = state_dir.join("aborts");
+    fs::create_dir_all(&aborts_dir)?;
+    let path = aborts_dir.join(format!("{scenario_id}.json"));
+    let rec = WatchAbortRecord {
+        scenario_id: scenario_id.to_string(),
+        watcher_agent: watcher_agent.to_string(),
+        failed_at: Local::now().to_rfc3339(),
+        is_rate_limit,
+        error: error.chars().take(400).collect(),
+    };
+    fs::write(&path, serde_json::to_string_pretty(&rec)?)?;
+    Ok(path)
+}
+
+pub fn clear_watch_abort(state_dir: &Path, scenario_id: &str) {
+    let path = state_dir.join("aborts").join(format!("{scenario_id}.json"));
+    let _ = fs::remove_file(path);
+}
+
+pub fn load_watch_abort(state_dir: &Path, scenario_id: &str) -> Option<WatchAbortRecord> {
+    let path = state_dir.join("aborts").join(format!("{scenario_id}.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// Computes a lightweight fingerprint of product source code state (excluding `scenarios/` and
@@ -113,8 +156,8 @@ pub fn load_runs_for_scenario(state_dir: &Path, scenario_id: &str) -> Result<Vec
     Ok(reports)
 }
 
-/// Analyzes run history (optionally appending an in-flight `latest_override` report)
-/// to determine whether the scenario is stuck/drifting on the exact same step/check.
+/// Analyzes run history to determine whether the scenario is stuck/drifting on the exact same
+/// step/check without forward progress (accounting for passed-check growth and failure-reason shifts).
 pub fn analyze_drift_from_reports(
     reports: &[WatchRunReport],
     cfg: &DriftConfig,
@@ -129,6 +172,9 @@ pub fn analyze_drift_from_reports(
     let mut consecutive_same_stop = 0usize;
     let mut code_changes_without_progress = 0usize;
     let mut next_newer_fp: Option<&str> = None;
+    let mut next_newer_passed: Option<usize> = None;
+    let mut next_newer_reason: Option<String> = None;
+    let mut reason_changed = false;
 
     for rep in reports.iter().rev() {
         if rep.new_status != ScenarioStatus::Failed
@@ -137,17 +183,38 @@ pub fn analyze_drift_from_reports(
         {
             break;
         }
+
+        let cur_passed = count_passed_checks(rep);
+        if let Some(newer_passed) = next_newer_passed
+            && newer_passed > cur_passed
+        {
+            // Concrete progress occurred inside the same scenario/step (more checks pass now).
+            break;
+        }
+
+        let cur_reason = normalize_reason(rep.stopped_reason.as_deref());
+        let transition_reason_changed = match (&next_newer_reason, &cur_reason) {
+            (Some(nr), Some(cr)) => nr != cr,
+            _ => false,
+        };
+        if consecutive_same_stop == 1 && transition_reason_changed {
+            reason_changed = true;
+        }
+
         consecutive_same_stop += 1;
 
         if let (Some(newer_fp), Some(cur_fp)) =
             (next_newer_fp, rep.worktree_fingerprint.as_deref())
             && newer_fp != cur_fp
+            && !transition_reason_changed
         {
             code_changes_without_progress += 1;
         }
         if let Some(cur_fp) = rep.worktree_fingerprint.as_deref() {
             next_newer_fp = Some(cur_fp);
         }
+        next_newer_passed = Some(cur_passed);
+        next_newer_reason = cur_reason;
     }
 
     let stagnant_thresh = cfg.stagnant_runs_threshold.max(1);
@@ -155,13 +222,18 @@ pub fn analyze_drift_from_reports(
     let is_drifting = consecutive_same_stop >= stagnant_thresh
         || code_changes_without_progress >= code_thresh;
 
+    let reason_shift_note = if reason_changed {
+        "（失敗理由は前回から変化あり）"
+    } else {
+        ""
+    };
     let reason = if code_changes_without_progress > 0 {
         format!(
-            "{consecutive_same_stop} 回連続（うちコード変更 {code_changes_without_progress} 回）で Step {stopped_step} ({stopped_check}) から前進していません"
+            "{consecutive_same_stop} 回連続（うちコード変更 {code_changes_without_progress} 回）で Step {stopped_step} ({stopped_check}) から前進していません{reason_shift_note}"
         )
     } else {
         format!(
-            "{consecutive_same_stop} 回連続で Step {stopped_step} ({stopped_check}) に停止しています"
+            "{consecutive_same_stop} 回連続で Step {stopped_step} ({stopped_check}) に停止しています{reason_shift_note}"
         )
     };
 
@@ -172,8 +244,25 @@ pub fn analyze_drift_from_reports(
         code_changes_without_progress,
         stopped_step,
         stopped_check,
+        reason_changed,
         reason,
     })
+}
+
+fn count_passed_checks(rep: &WatchRunReport) -> usize {
+    rep.step_results
+        .iter()
+        .flat_map(|s| s.checks.iter())
+        .filter(|c| c.state == CheckState::Passed)
+        .count()
+}
+
+fn normalize_reason(raw: Option<&str>) -> Option<String> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 pub fn analyze_scenario_drift(
@@ -388,15 +477,24 @@ pub fn render_agent_context(
             String::new()
         };
 
+        let abort_tag = match load_watch_abort(state_dir, &sc.front_matter.id) {
+            Some(ab) if ab.is_rate_limit => {
+                format!(" [前回見張り中断: {} 上限/制限]", ab.watcher_agent)
+            }
+            Some(ab) => format!(" [前回見張り中断: {}]", ab.watcher_agent),
+            None => String::new(),
+        };
+
         lines.push(format!(
-            "{prefix}[{}] {} `{}`: {}{}{}{}",
+            "{prefix}[{}] {} `{}`: {}{}{}{}{}",
             sc.front_matter.priority,
             sc.front_matter.status,
             sc.front_matter.id,
             sc.front_matter.title,
             blocked_note,
             stop_info,
-            drift_tag
+            drift_tag,
+            abort_tag
         ));
     }
 
@@ -447,6 +545,13 @@ fn is_ignored_harness_path(
     }
     rel.starts_with("scenarios")
         || rel.starts_with(".daihon")
+        || rel == Path::new(".daihon.toml")
+        || rel.starts_with(".agents")
+        || rel.starts_with(".claude")
+        || rel == Path::new("AGENTS.md")
+        || rel == Path::new("CLAUDE.md")
+        || rel == Path::new("GEMINI.md")
+        || rel == Path::new(".gitignore")
         || rel.starts_with(".git")
         || rel.starts_with("target")
         || rel.starts_with("node_modules")

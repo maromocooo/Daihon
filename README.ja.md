@@ -60,9 +60,9 @@ daihon fix                          # 承認を挟んで開発役 → 見張り�
 
 | コマンド | 役割 |
 | :--- | :--- |
-| `daihon init` | `.daihon.toml` と `scenarios/` を作成 |
+| `daihon init [--developer claude --watcher codex]` | `.daihon.toml` と `scenarios/` を作成し、`.gitignore` へ `.daihon/` を自動追記 |
 | `daihon validate [path]` | 保存形式と状態整合性をチェック（段階 1） |
-| `daihon tui [--dir ...]` | 最小 TUI（ツリー表示・`[DRIFT]` 警告・`0`〜`3` で優先度変更・`t` でト書き追加・`n` で新規シナリオ追加） |
+| `daihon tui [--dir ...]` | 最小 TUI（ツリー表示・`[DRIFT]`/`[中断]` 警告・`0`〜`3` で優先度変更・`m`/`Space` で `[manual]` 通過切替・`t` でト書き追加・`n` で新規シナリオ追加） |
 | `daihon status [--json]` | 非対話で一覧・停止箇所・ドリフト状態を表示（段階 2） |
 | `daihon context` | 開発役エージェントへ渡す現在地・ドリフト要約を出力 |
 | `daihon register "<自然言語>"` | 自然言語から大きな E2E シナリオを生成・重複検出・優先度案提示（段階 3） |

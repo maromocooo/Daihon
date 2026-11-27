@@ -4,7 +4,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use crate::runner::{AgentRequest, AgentResponse, AgentRunner, ExecutionMode, extract_json_value};
+use crate::runner::{
+    AgentRequest, AgentResponse, AgentRunner, ExecutionMode, INTERNAL_RUN_ENV, extract_json_value,
+};
 
 #[derive(Debug, Clone)]
 pub struct CodexRunner {
@@ -95,6 +97,7 @@ impl AgentRunner for CodexRunner {
         let mut child = Command::new(&self.binary)
             .args(&args)
             .envs(&req.env_vars)
+            .env(INTERNAL_RUN_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

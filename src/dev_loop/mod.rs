@@ -44,6 +44,7 @@ pub struct DevLoopOptions {
     pub environment: EnvironmentConfig,
     pub drift: DriftConfig,
     pub timeout_secs: u64,
+    pub developer_timeout_secs: u64,
     pub notify_topic: String,
     pub notify_on_ready_for_manual: bool,
 }
@@ -314,6 +315,17 @@ where
         created_tasks.push(task.clone());
 
         // Hand off task to the Developer agent with write access.
+        let dev_timeout = if options.developer_timeout_secs > 0 {
+            options.developer_timeout_secs
+        } else {
+            options.timeout_secs
+        };
+        let dev_started = std::time::Instant::now();
+        println!(
+            "開発役 ({}) を起動しています (timeout: {}s)...",
+            developer_runner.name(),
+            dev_timeout
+        );
         let dev_prompt = build_developer_prompt(&task);
         developer_runner.run(&AgentRequest {
             working_dir: options.working_dir.clone(),
@@ -322,8 +334,14 @@ where
             mode: ExecutionMode::WorkspaceWrite,
             sandbox_override: None,
             env_vars: options.environment.vars.clone(),
-            timeout_secs: options.timeout_secs,
+            timeout_secs: dev_timeout,
         })?;
+        println!(
+            "開発役 ({}) が完了しました ({}s)。見張り役 ({}) で再検証します...",
+            developer_runner.name(),
+            dev_started.elapsed().as_secs(),
+            watcher_runner.name()
+        );
 
         // Independently re-verify from Step 1 using the Watcher agent.
         let report = watch_scenario(&scenario_path, watcher_runner, notifier, &target_watch_opts)?;

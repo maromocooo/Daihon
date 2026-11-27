@@ -182,8 +182,13 @@ fn worktree_fingerprint_ignores_scenario_updates_and_detects_code_edits() {
         &state_dir
     ));
 
-    // Updating a scenario file must NOT be treated as a product code change.
+    // Updating a scenario file or harness config files must NOT be treated as a product code change.
     fs::write(scenarios_dir.join("01-test.md"), "updated status\n").unwrap();
+    fs::write(dir.path().join(".daihon.toml"), "scenarios_dir = \"scenarios\"\n").unwrap();
+    fs::create_dir_all(dir.path().join(".agents")).unwrap();
+    fs::write(dir.path().join(".agents/hooks.json"), "{}\n").unwrap();
+    fs::write(dir.path().join("CLAUDE.md"), "# rule\n").unwrap();
+    fs::write(dir.path().join(".gitignore"), ".daihon/\n").unwrap();
     assert!(is_unchanged_since_last_watch(
         dir.path(),
         &scenarios_dir,
@@ -229,4 +234,197 @@ hosts:
 "#;
     let sc = validate_str(md, None).expect("hosts front matter should validate");
     assert_eq!(sc.front_matter.hosts, vec!["mac-studio", "ubuntu-4090"]);
+}
+
+#[test]
+fn watcher_reuses_previous_passing_commands_handles_fallbacks_and_records_aborts() {
+    use daihon::config::HarnessConfig;
+    use daihon::runner::{AgentKind, AgentRunner};
+    use daihon::watcher::drift::load_watch_abort;
+    use daihon::watcher::{resolve_watcher_candidates, watch_scenario_with_fallbacks};
+
+    // 1. Candidate resolution excludes developer agent from fallbacks unless allowed.
+    let mut cfg = HarnessConfig::default();
+    cfg.agents.developer = AgentKind::Claude;
+    cfg.agents.watcher = AgentKind::Codex;
+    cfg.agents.watcher_fallbacks = vec![AgentKind::Claude, AgentKind::Agy];
+    let candidates = resolve_watcher_candidates(&cfg, None, false).unwrap();
+    assert_eq!(candidates, vec![AgentKind::Codex, AgentKind::Agy]);
+
+    // 2. Fallback on rate-limit error + previous passing command reuse + abort recording/clearing.
+    let dir = TempDir::new().unwrap();
+    let scenarios_dir = dir.path().join("scenarios");
+    let state_dir = dir.path().join(".daihon");
+    fs::create_dir_all(&scenarios_dir).unwrap();
+    let scenario_path = scenarios_dir.join("01-demo.md");
+    fs::write(
+        &scenario_path,
+        r#"---
+id: demo-app
+title: デモアプリ検証
+priority: P0
+status: pending
+---
+
+## 概要
+ビルドとヘッドレス起動を確認する。
+
+## ステップ
+
+### Step 1: 起動
+- status: pending
+
+- [ ] [auto] s1-c1: ビルドとヘッドレス起動が通る
+"#,
+    )
+    .unwrap();
+
+    let opts = WatchOptions {
+        working_dir: dir.path().to_path_buf(),
+        state_dir: state_dir.clone(),
+        timeout_secs: 60,
+        sandbox: Some("workspace-write".to_string()),
+        environment: EnvironmentConfig::default(),
+        drift: DriftConfig::default(),
+        parent_context: None,
+        notify_topic: "test".to_string(),
+        notify_on_ready_for_manual: true,
+    };
+
+    let rate_limited = MockRunner::from_fn("codex", |_req| {
+        Err(anyhow::anyhow!("usage limit reached (429 rate limit)"))
+    });
+    let fallback_ok = MockRunner::with_json_responses(
+        "agy",
+        vec![json!({
+            "checks": [{
+                "check_id": "s1-c1",
+                "passed": true,
+                "command_run": "cargo test --test headless_smoke",
+                "evidence": "ok",
+                "reason": null
+            }]
+        })],
+    );
+
+    // Primary fails with rate-limit -> fallback `agy` succeeds automatically!
+    let runners: Vec<&dyn AgentRunner> = vec![&rate_limited, &fallback_ok];
+    let rep = watch_scenario_with_fallbacks(&scenario_path, &runners, &NoopNotifier, &opts)
+        .expect("fallback watcher should recover from rate-limit");
+    assert_eq!(rep.watcher_agent, "agy");
+    assert_eq!(rep.new_status, ScenarioStatus::Passed);
+    assert!(load_watch_abort(&state_dir, "demo-app").is_none());
+
+    // #7: Watcher prompt includes sandbox GUI guidance.
+    assert!(
+        fallback_ok.recorded_calls()[0]
+            .prompt
+            .contains("サンドボックス環境内では macOS ネイティブ GUI")
+    );
+
+    // #8: Next watch run injects the previous passing `command_run` hint!
+    let run2 = MockRunner::with_json_responses(
+        "codex",
+        vec![json!({
+            "checks": [{
+                "check_id": "s1-c1",
+                "passed": true,
+                "command_run": "cargo test --test headless_smoke",
+                "evidence": "ok",
+                "reason": null
+            }]
+        })],
+    );
+    watch_scenario(&scenario_path, &run2, &NoopNotifier, &opts).unwrap();
+    assert!(
+        run2.recorded_calls()[0]
+            .prompt
+            .contains("cargo test --test headless_smoke"),
+        "前回通過時の検証コマンドが見張りプロンプトへ引き継がれるべき"
+    );
+
+    // When ALL watchers abort, an abort record is persisted so status/TUI warn of stale state.
+    let all_fail: Vec<&dyn AgentRunner> = vec![&rate_limited];
+    assert!(watch_scenario_with_fallbacks(&scenario_path, &all_fail, &NoopNotifier, &opts).is_err());
+    let abort = load_watch_abort(&state_dir, "demo-app").expect("abort record persisted");
+    assert_eq!(abort.watcher_agent, "codex");
+    assert!(abort.is_rate_limit);
+}
+
+#[test]
+fn drift_avoids_false_positive_when_failure_reason_progresses_or_checks_increase() {
+    use daihon::model::{CheckState, VerifyMode};
+    use daihon::watcher::{CheckEvalRecord, StepEvalRecord, WatchRunReport};
+
+    let make_report = |run_id: &str, fp: &str, reason: &str, extra_passed: bool| WatchRunReport {
+        run_id: run_id.to_string(),
+        scenario_id: "s".to_string(),
+        scenario_path: "scenarios/01-s.md".into(),
+        watcher_agent: "codex".to_string(),
+        started_at: "2026-11-26T00:00:00+09:00".to_string(),
+        finished_at: "2026-11-26T00:01:00+09:00".to_string(),
+        previous_status: ScenarioStatus::Failed,
+        new_status: ScenarioStatus::Failed,
+        stopped_step: Some(1),
+        stopped_check: Some("s1-c1".to_string()),
+        stopped_reason: Some(reason.to_string()),
+        step_results: vec![StepEvalRecord {
+            step_number: 1,
+            step_title: "Step 1".to_string(),
+            checks: vec![
+                CheckEvalRecord {
+                    check_id: "s1-c1".to_string(),
+                    mode: VerifyMode::Auto,
+                    state: CheckState::Failed,
+                    command_run: None,
+                    evidence: None,
+                    reason: Some(reason.to_string()),
+                },
+                CheckEvalRecord {
+                    check_id: "s1-c2".to_string(),
+                    mode: VerifyMode::Auto,
+                    state: if extra_passed {
+                        CheckState::Passed
+                    } else {
+                        CheckState::Failed
+                    },
+                    command_run: None,
+                    evidence: None,
+                    reason: None,
+                },
+            ],
+        }],
+        notified: false,
+        git_head: None,
+        worktree_fingerprint: Some(fp.to_string()),
+        drift: None,
+        report_path: "runs/r.json".into(),
+    };
+
+    let cfg = DriftConfig {
+        stagnant_runs_threshold: 3,
+        code_changes_threshold: 2,
+    };
+
+    // Failure reason progressed across two code changes -> code_changes_without_progress stays 0 (not drifting)!
+    let reports_progress = vec![
+        make_report("r1", "fp1", "package.json がない", false),
+        make_report("r2", "fp2", "アプリは起動するがチャット欄がない", false),
+    ];
+    let d_prog = daihon::watcher::drift::analyze_drift_from_reports(&reports_progress, &cfg)
+        .expect("summary");
+    assert!(!d_prog.is_drifting);
+    assert!(d_prog.reason_changed);
+    assert_eq!(d_prog.code_changes_without_progress, 0);
+
+    // Extra check started passing inside the same step -> resets stagnation streak to 1!
+    let reports_check_growth = vec![
+        make_report("r1", "fp1", "同じ理由", false),
+        make_report("r2", "fp2", "同じ理由", false),
+        make_report("r3", "fp3", "同じ理由", true),
+    ];
+    let d_growth = daihon::watcher::drift::analyze_drift_from_reports(&reports_check_growth, &cfg)
+        .expect("summary");
+    assert!(!d_growth.is_drifting);
+    assert_eq!(d_growth.consecutive_same_stop, 1);
 }

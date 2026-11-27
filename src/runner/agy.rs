@@ -3,7 +3,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::runner::{AgentRequest, AgentResponse, AgentRunner, ExecutionMode, extract_json_value};
+use crate::runner::{
+    AgentRequest, AgentResponse, AgentRunner, ExecutionMode, INTERNAL_RUN_ENV, extract_json_value,
+};
 
 #[derive(Debug, Clone)]
 pub struct AgyRunner {
@@ -35,19 +37,26 @@ impl AgyRunner {
             args.push("text".to_string());
         }
 
-        // Note: Do NOT pass `--mode plan` for structured JSON calls because `plan` triggers
-        // Antigravity's planning workflow instead of answering the JSON schema directly.
-        match req.mode {
-            ExecutionMode::ReadOnly => {
-                args.push("--sandbox".to_string());
-            }
-            ExecutionMode::Verify => {
-                args.push("--mode".to_string());
-                args.push("auto".to_string());
-            }
-            ExecutionMode::WorkspaceWrite => {
-                args.push("--mode".to_string());
-                args.push("accept-edits".to_string());
+        // Note:
+        // - Do NOT pass `--mode plan` for structured JSON calls because `plan` triggers
+        //   Antigravity's planning workflow instead of answering the JSON schema directly.
+        // - Do NOT pass `--mode auto` because some accounts do not have `--mode auto` enabled,
+        //   causing agy to fall back to interactive default mode and time out in print mode.
+        let has_mode_override = self.extra_args.iter().any(|a| {
+            a == "--mode"
+                || a.starts_with("--mode=")
+                || a == "--dangerously-skip-permissions"
+                || a == "--sandbox"
+        });
+        if !has_mode_override {
+            match req.mode {
+                ExecutionMode::ReadOnly | ExecutionMode::Verify => {
+                    args.push("--sandbox".to_string());
+                }
+                ExecutionMode::WorkspaceWrite => {
+                    args.push("--mode".to_string());
+                    args.push("accept-edits".to_string());
+                }
             }
         }
 
@@ -96,6 +105,7 @@ impl AgentRunner for AgyRunner {
             .args(&args)
             .current_dir(&req.working_dir)
             .envs(&req.env_vars)
+            .env(INTERNAL_RUN_ENV, "1")
             .output()
             .with_context(|| format!("`{}` の起動に失敗しました", self.binary));
 

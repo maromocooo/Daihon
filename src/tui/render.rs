@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::model::scenario::{CheckState, Scenario, ScenarioStatus, StepStatus, VerifyMode};
 use crate::model::store::TreeEntry;
 use crate::tui::app::{App, ChildrenSummary, DraftTarget, FocusPane, ModalState};
-use crate::watcher::drift::DriftSummary;
+use crate::watcher::drift::{DriftSummary, WatchAbortRecord};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
@@ -130,6 +130,14 @@ fn render_scenario_list(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            if app.abort_for(&sc.front_matter.id).is_some() {
+                header_spans.push(Span::styled(
+                    "[中断] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
 
             let header_line = Line::from(header_spans.clone());
             let title_text = sc.front_matter.title.clone();
@@ -200,17 +208,45 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .title(title);
 
-    let inner_width = block.inner(area).width as usize;
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
+    let viewport_height = inner.height as usize;
+    let detail_focused = app.focus == FocusPane::Detail;
     let children_summary = app.children_summary_for(&sc.front_matter.id);
-    let raw_lines = build_detail_lines(
+    let (raw_lines, selected_raw_line) = build_detail_lines(
         entry,
         app.drift_for(&sc.front_matter.id),
+        app.abort_for(&sc.front_matter.id),
         &children_summary,
+        detail_focused,
+        app.selected_check,
     );
-    let wrapped_lines = wrap_lines_for_width(raw_lines, inner_width);
+
+    let mut wrapped_lines = Vec::with_capacity(raw_lines.len());
+    let mut selected_wrapped_line: Option<usize> = None;
+    for (idx, line) in raw_lines.into_iter().enumerate() {
+        if selected_raw_line == Some(idx) {
+            selected_wrapped_line = Some(wrapped_lines.len());
+        }
+        wrapped_lines.extend(wrap_single_detail_line(line, inner_width));
+    }
+
+    // Auto-keep highlighted check item visible inside the Detail viewport when focused.
+    let mut scroll_y = app.detail_scroll as usize;
+    if detail_focused
+        && let Some(sel_y) = selected_wrapped_line
+        && viewport_height > 0
+    {
+        if sel_y < scroll_y {
+            scroll_y = sel_y;
+        } else if sel_y >= scroll_y + viewport_height {
+            scroll_y = sel_y + 1 - viewport_height;
+        }
+    }
+
     let detail = Paragraph::new(wrapped_lines)
         .block(block)
-        .scroll((app.detail_scroll, 0));
+        .scroll((scroll_y as u16, 0));
 
     frame.render_widget(detail, area);
 }
@@ -218,8 +254,11 @@ fn render_scenario_detail(frame: &mut Frame, app: &App, area: Rect) {
 fn build_detail_lines(
     entry: &TreeEntry,
     drift: Option<&DriftSummary>,
+    abort: Option<&WatchAbortRecord>,
     children: &ChildrenSummary,
-) -> Vec<Line<'static>> {
+    detail_focused: bool,
+    selected_check: usize,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let sc: &Scenario = &entry.loaded.scenario;
     let mut lines = Vec::new();
     let (badge, color) = scenario_badge(sc.front_matter.status);
@@ -314,6 +353,26 @@ fn build_detail_lines(
         )));
     }
 
+    if let Some(ab) = abort {
+        lines.push(Line::raw(""));
+        let kind_hint = if ab.is_rate_limit {
+            "上限/タイムアウト"
+        } else {
+            "エラー"
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "⚠ 前回の見張り実行が中断しました ({} / {kind_hint} / {}): {}",
+                ab.watcher_agent,
+                ab.failed_at,
+                ab.error.lines().next().unwrap_or("")
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "概要",
@@ -332,6 +391,9 @@ fn build_detail_lines(
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
+
+    let mut flat_check_idx = 0usize;
+    let mut selected_raw_line: Option<usize> = None;
 
     for step in &sc.steps {
         let (st_badge, st_color) = step_badge(step.status);
@@ -354,13 +416,22 @@ fn build_detail_lines(
         }
 
         for check in &step.checks {
+            let is_active_check = detail_focused && flat_check_idx == selected_check;
+            flat_check_idx += 1;
+
             let (mark_style, mode_label) = (
                 match check.state {
                     CheckState::Passed => Style::default().fg(Color::Green),
                     CheckState::Failed => {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                     }
-                    CheckState::Pending => Style::default().fg(Color::DarkGray),
+                    CheckState::Pending => {
+                        if is_active_check {
+                            Style::default().fg(Color::Gray)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }
+                    }
                 },
                 match check.mode {
                     VerifyMode::Auto => "auto",
@@ -373,16 +444,51 @@ fn build_detail_lines(
                 VerifyMode::Manual => Color::Yellow,
             };
 
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("[{}] ", check.state.marker()), mark_style),
-                Span::styled(format!("[{mode_label}] "), Style::default().fg(mode_color)),
-                Span::styled(
-                    format!("{}: ", check.id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(check.description.clone()),
-            ]));
+            let id_color = if is_active_check {
+                Color::White
+            } else {
+                Color::DarkGray
+            };
+
+            if is_active_check {
+                selected_raw_line = Some(lines.len());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "▸ ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", check.state.marker()),
+                        mark_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{mode_label}] "),
+                        Style::default()
+                            .fg(mode_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{}: ", check.id),
+                        Style::default().fg(id_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        check.description.clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("[{}] ", check.state.marker()), mark_style),
+                    Span::styled(format!("[{mode_label}] "), Style::default().fg(mode_color)),
+                    Span::styled(format!("{}: ", check.id), Style::default().fg(id_color)),
+                    Span::raw(check.description.clone()),
+                ]));
+            }
 
             if let Some(ref reason) = check.reason {
                 lines.push(Line::from(Span::styled(
@@ -394,22 +500,28 @@ fn build_detail_lines(
         lines.push(Line::raw(""));
     }
 
-    lines
+    (lines, selected_raw_line)
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let narrow = area.width < 96;
-    let help = match &app.modal {
-        ModalState::None if narrow => {
-            "j/k:移動 0-3:優先度 t:ト書き n:新規 Tab:切替 r:再読込 q:終了"
+    let narrow = area.width < 104;
+    let help = match (&app.modal, app.focus) {
+        (ModalState::None, FocusPane::Detail) if narrow => {
+            "j/k:項目 Space/x:通過 !:失敗 u:未検証 Tab:一覧 q:終了"
         }
-        ModalState::None => {
-            "↑/↓(j/k): 選択  0-3: 優先度  t: ト書き追加  n: 新規シナリオ  Tab: ペイン切替  r: 再読込  q: 終了"
+        (ModalState::None, FocusPane::Detail) => {
+            "↑/↓(j/k): チェック選択  Space/x: 通過切替  !: 失敗  u: 未検証  J/K: スクロール  Tab: 一覧へ  q: 終了"
         }
-        ModalState::Input { .. } => "自然言語で入力  Enter: 生成  Esc: キャンセル",
-        ModalState::Generating { .. } => "登録エージェントで構造化中...  Esc: キャンセル",
-        ModalState::Preview { .. } if narrow => "y/Enter:保存 0-3:P0-P3 j/k:移動 n/Esc:戻",
-        ModalState::Preview { .. } => {
+        (ModalState::None, FocusPane::List) if narrow => {
+            "j/k:移動 0-3:優先度 m:手動確認 t:ト書き n:新規 Tab:詳細 q:終了"
+        }
+        (ModalState::None, FocusPane::List) => {
+            "↑/↓(j/k): 選択  0-3: 優先度  m: 手動確認  t: ト書き追加  n: 新規  Tab: 詳細  r: 再読込  q: 終了"
+        }
+        (ModalState::Input { .. }, _) => "自然言語で入力  Enter: 生成  Esc: キャンセル",
+        (ModalState::Generating { .. }, _) => "登録エージェントで構造化中...  Esc: キャンセル",
+        (ModalState::Preview { .. }, _) if narrow => "y/Enter:保存 0-3:P0-P3 j/k:移動 n/Esc:戻",
+        (ModalState::Preview { .. }, _) => {
             "y/Enter: 保存  0-3: 優先度変更(P0..P3)  ↑/↓(j/k): スクロール  n/Esc: キャンセル"
         }
     };
@@ -791,28 +903,33 @@ fn wrap_styled_line(
     out
 }
 
+fn wrap_single_detail_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+    let max_width = max_width.max(4);
+    let first_text = line
+        .spans
+        .first()
+        .map(|s| s.content.as_ref())
+        .unwrap_or("");
+    let second_text = line
+        .spans
+        .get(1)
+        .map(|s| s.content.as_ref())
+        .unwrap_or("");
+    let continuation = if first_text.starts_with("      └─ ") {
+        "         "
+    } else if (first_text == "  " || first_text == "▸ ") && second_text.starts_with('[') {
+        "      "
+    } else {
+        ""
+    };
+    wrap_styled_line(line, max_width, continuation)
+}
+
 fn wrap_lines_for_width(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
     let max_width = max_width.max(4);
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let first_text = line
-            .spans
-            .first()
-            .map(|s| s.content.as_ref())
-            .unwrap_or("");
-        let second_text = line
-            .spans
-            .get(1)
-            .map(|s| s.content.as_ref())
-            .unwrap_or("");
-        let continuation = if first_text.starts_with("      └─ ") {
-            "         "
-        } else if first_text == "  " && second_text.starts_with('[') {
-            "      "
-        } else {
-            ""
-        };
-        out.extend(wrap_styled_line(line, max_width, continuation));
+        out.extend(wrap_single_detail_line(line, max_width));
     }
     out
 }

@@ -135,6 +135,7 @@ def cmd_handoff(args: list[str]) -> int:
         environment: EnvironmentConfig::default(),
         drift: DriftConfig::default(),
         timeout_secs: 60,
+        developer_timeout_secs: 900,
         notify_topic: "test-topic".to_string(),
         notify_on_ready_for_manual: true,
     };

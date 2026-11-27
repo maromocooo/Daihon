@@ -19,10 +19,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::config::HarnessConfig;
-use crate::model::Priority;
+use crate::model::{CheckState, Priority};
 use crate::register::{RegistrationProposal, propose_registration, propose_togaki, save_registration};
 use crate::runner::build_runner;
-use crate::tui::app::{App, DraftTarget, ModalState};
+use crate::tui::app::{App, DraftTarget, FocusPane, ModalState};
 
 struct TerminalGuard;
 
@@ -37,7 +37,12 @@ impl Drop for TerminalGuard {
 /// including direct `t` (add Togaki) and `n` (new scenario) registration modals.
 pub fn run_tui(workdir: &Path, scenarios_dir: &Path, config: &HarnessConfig) -> Result<()> {
     let state_dir = config.resolve_state_dir(workdir);
-    let mut app = App::load_with_state(scenarios_dir, &state_dir, config.drift.clone())?;
+    let mut app = App::load_with_config(
+        scenarios_dir,
+        &state_dir,
+        config.drift.clone(),
+        config.notify.clone(),
+    )?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -112,6 +117,30 @@ pub fn run_tui(workdir: &Path, scenarios_dir: &Path, config: &HarnessConfig) -> 
                             KeyCode::Up | KeyCode::Char('k') => app.previous(),
                             KeyCode::Tab => app.toggle_focus(),
                             KeyCode::Char('r') => app.reload(),
+                            KeyCode::Char('m') if app.focus == FocusPane::List => {
+                                app.focus_manual_checks();
+                            }
+                            KeyCode::Char(' ') | KeyCode::Char('x')
+                                if app.focus == FocusPane::Detail =>
+                            {
+                                app.toggle_selected_check_passed();
+                            }
+                            KeyCode::Char('!') if app.focus == FocusPane::Detail => {
+                                app.set_selected_check_state(CheckState::Failed);
+                            }
+                            KeyCode::Char('u') if app.focus == FocusPane::Detail => {
+                                app.set_selected_check_state(CheckState::Pending);
+                            }
+                            KeyCode::PageDown | KeyCode::Char('J')
+                                if app.focus == FocusPane::Detail =>
+                            {
+                                app.scroll_detail_down();
+                            }
+                            KeyCode::PageUp | KeyCode::Char('K')
+                                if app.focus == FocusPane::Detail =>
+                            {
+                                app.scroll_detail_up();
+                            }
                             KeyCode::Char('0') => app.set_selected_priority(Priority::P0),
                             KeyCode::Char('1') => app.set_selected_priority(Priority::P1),
                             KeyCode::Char('2') => app.set_selected_priority(Priority::P2),

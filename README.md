@@ -81,9 +81,9 @@ daihon notify test
 
 | Command | Description |
 | :--- | :--- |
-| `daihon init` | Initialize `.daihon.toml` and `scenarios/` in a repository |
+| `daihon init [--developer claude --watcher codex]` | Initialize `.daihon.toml`, `scenarios/`, and append `.daihon/` to `.gitignore` |
 | `daihon validate [path]` | Validate scenario Markdown/front matter format and status consistency |
-| `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (tree view, `[DRIFT]` alerts, `0`–`3` priority edit, `t` Togaki, `n` new scenario) |
+| `daihon tui [--dir ...]` | Open the minimal `ratatui` TUI (tree view, `[DRIFT]`/`[中断]` alerts, `0`–`3` priority, `m`/`Space` manual check toggle, `t` Togaki, `n` new scenario) |
 | `daihon status [--json]` | Print non-interactive scenario status summary and stopped steps |
 | `daihon context` | Output concise current-state / drift brief for coding agent sessions |
 | `daihon register "<text>"` | Turn natural language into a structured E2E scenario with overlap & priority proposals |

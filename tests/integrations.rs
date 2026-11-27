@@ -321,4 +321,62 @@ agy = ["--model", "pro"]
         .position(|a| a == "--print=implement feature")
         .unwrap();
     assert!(agy_model_pos < print_pos);
+
+    // #11: Agy Verify mode MUST NOT pass unsupported `--mode auto`; it uses `--sandbox`.
+    let verify_req = AgentRequest {
+        mode: ExecutionMode::Verify,
+        ..req.clone()
+    };
+    let agy_verify = AgyRunner::new("agy").build_args(&verify_req, None);
+    assert!(agy_verify.contains(&"--sandbox".to_string()));
+    assert!(
+        !agy_verify.contains(&"auto".to_string()),
+        "Agy Verify mode must not emit `--mode auto`: {agy_verify:?}"
+    );
+
+    // #5: Claude WorkspaceWrite streams progress via stream-json and parses tool/result events.
+    assert!(claude_args.contains(&"stream-json".to_string()));
+    assert!(claude_args.contains(&"--verbose".to_string()));
+    let (tool_label, tool_res) = daihon::runner::claude::parse_claude_stream_line(
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit"}]}}"#,
+    );
+    assert_eq!(tool_label.as_deref(), Some("ツール実行: Edit"));
+    assert!(tool_res.is_none());
+    let (done_label, done_res) = daihon::runner::claude::parse_claude_stream_line(
+        r#"{"type":"result","result":"done implementing"}"#,
+    );
+    assert_eq!(done_label.as_deref(), Some("完了"));
+    assert_eq!(done_res.as_deref(), Some("done implementing"));
+}
+
+#[test]
+fn internal_child_run_env_prevents_recursive_hook_triggering() {
+    use std::process::Command;
+
+    let dir = TempDir::new().unwrap();
+    let scenarios_dir = dir.path().join("scenarios");
+    fs::create_dir_all(&scenarios_dir).unwrap();
+    fs::copy(
+        "examples/scenarios/01-rio-herdr-cross-machine.md",
+        scenarios_dir.join("01-rio-herdr-cross-machine.md"),
+    )
+    .unwrap();
+
+    // When DAIHON_INTERNAL_RUN=1 is set (as all runners inject into child agents),
+    // hook-event must immediately short-circuit without creating hook trigger state.
+    let bin = env!("CARGO_BIN_EXE_daihon");
+    let out = Command::new(bin)
+        .args(["--workdir", &dir.path().to_string_lossy(), "hook-event", "agy-stop"])
+        .env(daihon::runner::INTERNAL_RUN_ENV, "1")
+        .output()
+        .expect("run daihon hook-event");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"{"decision":"allow"}"#
+    );
+    assert!(
+        !dir.path().join(".daihon/last-hook-trigger.txt").exists(),
+        "DAIHON_INTERNAL_RUN=1 のときはフック経由の見張りトリガーを記録・起動しないこと"
+    );
 }

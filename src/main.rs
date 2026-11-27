@@ -24,7 +24,8 @@ use daihon::register::{propose_registration, propose_togaki, save_registration};
 use daihon::runner::{AgentKind, build_runner};
 use daihon::tui::run_tui;
 use daihon::watcher::drift::{
-    DriftSummary, analyze_scenario_drift, compute_worktree_fingerprint, render_agent_context,
+    DriftSummary, WatchAbortRecord, analyze_scenario_drift, compute_worktree_fingerprint,
+    load_watch_abort, render_agent_context,
 };
 use daihon::watcher::trigger::{
     BackgroundWatchRequest, HookEventKind, RunLock, daemon_status, handle_hook_event,
@@ -32,8 +33,8 @@ use daihon::watcher::trigger::{
     record_last_watch_fingerprint, spawn_background_watch, stop_daemon_watch,
 };
 use daihon::watcher::{
-    ParentContext, WatchOptions, resolve_distinct_watcher_agent, update_check_manually,
-    watch_scenario,
+    ParentContext, WatchOptions, resolve_watcher_candidates, update_check_manually,
+    watch_scenario_with_fallbacks,
 };
 
 #[derive(Debug, Parser)]
@@ -53,11 +54,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// プロジェクトに設定ファイル（.daihon.toml）と scenarios/ を初期作成する
+    /// プロジェクトに設定ファイル（.daihon.toml）と scenarios/ を初期作成し、.gitignore に .daihon/ を追記する
     Init {
         /// 既存の設定ファイルを上書きする
         #[arg(long)]
         force: bool,
+
+        /// 登録役エージェントの初期設定（agy | codex | claude）
+        #[arg(long)]
+        register: Option<AgentKind>,
+
+        /// 開発役エージェントの初期設定（agy | codex | claude）
+        #[arg(long)]
+        developer: Option<AgentKind>,
+
+        /// 見張り役エージェントの初期設定（agy | codex | claude）
+        #[arg(long)]
+        watcher: Option<AgentKind>,
+
+        /// .gitignore への `.daihon/` 自動追記をスキップする
+        #[arg(long)]
+        no_gitignore: bool,
     },
 
     /// シナリオファイルの保存形式と状態整合性をチェックする（段階1）
@@ -367,6 +384,7 @@ struct StatusSummaryRow {
     stopped_step: Option<usize>,
     failed_check: Option<String>,
     drift: Option<DriftSummary>,
+    watch_abort: Option<WatchAbortRecord>,
     last_checked_at: Option<String>,
     last_checked_by: Option<String>,
     path: PathBuf,
@@ -415,7 +433,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Commands::HookEvent { .. } => unreachable!(),
 
-        Commands::Init { force } => {
+        Commands::Init {
+            force,
+            register,
+            developer,
+            watcher,
+            no_gitignore,
+        } => {
             fs::create_dir_all(&workdir).with_context(|| {
                 format!("作業ディレクトリを作成できません: {}", workdir.display())
             })?;
@@ -426,12 +450,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     cfg_path.display()
                 );
             } else {
-                fs::write(&cfg_path, HarnessConfig::sample_toml())?;
+                let reg = register.unwrap_or(AgentKind::Agy);
+                let dev = developer.unwrap_or(AgentKind::Agy);
+                let wat = watcher.unwrap_or(if dev == AgentKind::Codex {
+                    AgentKind::Agy
+                } else {
+                    AgentKind::Codex
+                });
+                fs::write(&cfg_path, HarnessConfig::render_init_toml(reg, dev, wat))?;
                 println!("設定ファイルを作成しました: {}", cfg_path.display());
             }
             let sc_dir = config.resolve_scenarios_dir(&workdir, None);
             fs::create_dir_all(&sc_dir)?;
             println!("シナリオディレクトリを準備しました: {}", sc_dir.display());
+
+            if !no_gitignore && ensure_gitignore_has_daihon(&workdir)? {
+                println!(
+                    ".gitignore に `.daihon/` を追記しました: {}",
+                    workdir.join(".gitignore").display()
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -589,8 +627,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            let watcher_kind = resolve_distinct_watcher_agent(&config, watcher, allow_same_agent)?;
-            let runner = build_runner(watcher_kind, &config)?;
+            let candidate_kinds =
+                resolve_watcher_candidates(&config, watcher, allow_same_agent)?;
+            let mut runners = Vec::with_capacity(candidate_kinds.len());
+            for kind in candidate_kinds {
+                runners.push(build_runner(kind, &config)?);
+            }
+            let runner_refs: Vec<&dyn daihon::runner::AgentRunner> =
+                runners.iter().map(|r| r.as_ref()).collect();
             let (notifier, topic) = build_notifier(&config.notify, &state_dir, dry_run_notify);
 
             let watch_opts = WatchOptions {
@@ -615,7 +659,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         scenario.as_deref(),
                         &state_dir,
                         if_changed,
-                        runner.as_ref(),
+                        &runner_refs,
                         notifier.as_ref(),
                         &watch_opts,
                     )?;
@@ -628,7 +672,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     scenario.as_deref(),
                     &state_dir,
                     if_changed,
-                    runner.as_ref(),
+                    &runner_refs,
                     notifier.as_ref(),
                     &watch_opts,
                 )?;
@@ -738,6 +782,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 environment: config.environment.clone(),
                 drift: config.drift.clone(),
                 timeout_secs: config.watcher.timeout_secs,
+                developer_timeout_secs: config.loop_policy.developer_timeout_secs,
                 notify_topic: topic,
                 notify_on_ready_for_manual: config.notify.notify_on_ready_for_manual,
             };
@@ -928,29 +973,40 @@ fn cmd_register_or_togaki(
 ) -> Result<()> {
     let input = read_register_input(text, parent_id.is_some())?;
     let agent_kind = agent.unwrap_or(config.agents.register);
-    let runner = build_runner(agent_kind, config)?;
-
-    let proposal = if let Some(pid) = parent_id {
-        println!("登録エージェント ({agent_kind}) で親 `{pid}` 向けのト書き（Togaki）を構造化しています...");
-        propose_togaki(
-            pid,
-            &input,
-            attach_step,
-            scenarios_dir,
-            runner.as_ref(),
-            workdir,
-            config.watcher.timeout_secs,
-        )?
+    let wait_label = if let Some(pid) = parent_id {
+        format!("登録エージェント ({agent_kind}) で親 `{pid}` 向けのト書き（Togaki）を構造化中")
     } else {
-        println!("登録エージェント ({agent_kind}) でシナリオを構造化しています...");
-        propose_registration(
-            &input,
-            scenarios_dir,
-            runner.as_ref(),
-            workdir,
-            config.watcher.timeout_secs,
-        )?
+        format!("登録エージェント ({agent_kind}) でシナリオを構造化中")
     };
+
+    let workdir_owned = workdir.to_path_buf();
+    let scenarios_dir_owned = scenarios_dir.to_path_buf();
+    let config_owned = config.clone();
+    let parent_owned = parent_id.map(ToOwned::to_owned);
+    let input_owned = input.clone();
+
+    let proposal = run_with_elapsed_progress(&wait_label, move || {
+        let runner = build_runner(agent_kind, &config_owned)?;
+        if let Some(ref pid) = parent_owned {
+            propose_togaki(
+                pid,
+                &input_owned,
+                attach_step,
+                &scenarios_dir_owned,
+                runner.as_ref(),
+                &workdir_owned,
+                config_owned.watcher.timeout_secs,
+            )
+        } else {
+            propose_registration(
+                &input_owned,
+                &scenarios_dir_owned,
+                runner.as_ref(),
+                &workdir_owned,
+                config_owned.watcher.timeout_secs,
+            )
+        }
+    })?;
 
     let label = if parent_id.is_some() {
         "ト書き（Togaki）案"
@@ -1026,6 +1082,7 @@ fn cmd_status(
             .count();
         let stopped = sc.steps.iter().find(|s| s.status == StepStatus::Failed);
         let drift = analyze_scenario_drift(state_dir, &sc.front_matter.id, drift_cfg)?;
+        let watch_abort = load_watch_abort(state_dir, &sc.front_matter.id);
         tree_meta.push((entry.depth, entry.is_last_sibling));
         rows.push(StatusSummaryRow {
             id: sc.front_matter.id,
@@ -1040,6 +1097,7 @@ fn cmd_status(
             stopped_step: stopped.map(|s| s.number),
             failed_check: stopped.and_then(|s| s.failed_check.clone()),
             drift,
+            watch_abort,
             last_checked_at: sc.front_matter.last_checked_at,
             last_checked_by: sc.front_matter.last_checked_by,
             path: entry.loaded.path,
@@ -1096,7 +1154,14 @@ fn cmd_status(
                 Some(d) if d.is_drifting => format!("  [DRIFT x{}]", d.consecutive_same_stop),
                 _ => String::new(),
             };
-            format!("{stop_note}{drift_note}")
+            let abort_note = match &row.watch_abort {
+                Some(ab) if ab.is_rate_limit => {
+                    format!("  [見張り中断: {} 上限/制限]", ab.watcher_agent)
+                }
+                Some(ab) => format!("  [見張り中断: {}]", ab.watcher_agent),
+                None => String::new(),
+            };
+            format!("{stop_note}{drift_note}{abort_note}")
         };
         println!(
             "{prefix}[{badge}] {} ({}/{}) {kind_tag}{} — {}{extra_note}",
@@ -1118,7 +1183,7 @@ fn run_watch_once(
     scenario_filter: Option<&str>,
     state_dir: &Path,
     if_changed: bool,
-    runner: &dyn daihon::runner::AgentRunner,
+    runners: &[&dyn daihon::runner::AgentRunner],
     notifier: &dyn daihon::notify::Notifier,
     options: &WatchOptions,
 ) -> Result<bool> {
@@ -1194,13 +1259,12 @@ fn run_watch_once(
         } else {
             ""
         };
+        let primary_name = runners.first().map(|r| r.name()).unwrap_or("watcher");
         println!(
-            "見張り実行中 ({}) : {kind_label}[{}] {}",
-            runner.name(),
-            target.scenario.front_matter.priority,
-            id
+            "見張り実行中 ({primary_name}) : {kind_label}[{}] {}",
+            target.scenario.front_matter.priority, id
         );
-        let report = watch_scenario(&target.path, runner, notifier, &per_opts)?;
+        let report = watch_scenario_with_fallbacks(&target.path, runners, notifier, &per_opts)?;
         if matches!(
             report.new_status,
             ScenarioStatus::Passed | ScenarioStatus::ReadyForManual
@@ -1390,6 +1454,81 @@ fn prompt_registration_confirmation(default_priority: Priority) -> Result<Confir
     Ok(ConfirmAction::Cancel)
 }
 
+fn ensure_gitignore_has_daihon(workdir: &Path) -> Result<bool> {
+    let gitignore_path = workdir.join(".gitignore");
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+    let already_ignored = existing
+        .lines()
+        .map(str::trim)
+        .any(|line| line == ".daihon/" || line == ".daihon" || line == "/.daihon/" || line == "/.daihon");
+    if already_ignored {
+        return Ok(false);
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(".daihon/\n");
+    fs::write(&gitignore_path, updated)?;
+    Ok(true)
+}
+
+fn run_with_elapsed_progress<T, F>(label: &str, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
+    if !is_tty {
+        println!("{label}...");
+        let _ = io::stdout().flush();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let started = std::time::Instant::now();
+    let mut tick = 0usize;
+    let mut last_heartbeat_secs = 0u64;
+
+    let result = loop {
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(res) => break res,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let secs = started.elapsed().as_secs();
+                if is_tty {
+                    let spin = SPINNER[tick % SPINNER.len()];
+                    print!("\r{spin} {label}... ({secs}s)");
+                    let _ = io::stdout().flush();
+                    tick = tick.wrapping_add(1);
+                } else if secs >= last_heartbeat_secs + 15 {
+                    last_heartbeat_secs = secs;
+                    println!("  ...引き続き処理中 ({secs}s 経過)");
+                    let _ = io::stdout().flush();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("登録エージェントの処理スレッドが予期せず終了しました");
+            }
+        }
+    };
+
+    let _ = handle.join();
+    if is_tty {
+        let secs = started.elapsed().as_secs();
+        println!("\r✓ {label} 完了 ({secs}s)          ");
+    }
+    result
+}
+
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
     print!("{prompt}");
     io::stdout().flush()?;
@@ -1463,5 +1602,32 @@ mod tests {
         .unwrap();
         assert_eq!(pid, "rio-herdr-cross-machine");
         assert_eq!(txt.as_deref(), Some("遅延が 50ms 以内に収まること"));
+    }
+
+    #[test]
+    fn ensure_gitignore_has_daihon_creates_appends_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        assert!(ensure_gitignore_has_daihon(dir.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            ".daihon/\n"
+        );
+        // Second call is idempotent.
+        assert!(!ensure_gitignore_has_daihon(dir.path()).unwrap());
+
+        // Appending to existing file without trailing newline adds newline cleanly.
+        let dir2 = TempDir::new().unwrap();
+        fs::write(dir2.path().join(".gitignore"), "target/").unwrap();
+        assert!(ensure_gitignore_has_daihon(dir2.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir2.path().join(".gitignore")).unwrap(),
+            "target/\n.daihon/\n"
+        );
+
+        // render_init_toml reflects custom agent roles.
+        let toml = HarnessConfig::render_init_toml(AgentKind::Agy, AgentKind::Claude, AgentKind::Codex);
+        assert!(toml.contains("developer = \"claude\""));
+        assert!(toml.contains("watcher = \"codex\""));
+        assert!(toml.contains("developer_timeout_secs = 900"));
     }
 }

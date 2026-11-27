@@ -3,13 +3,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::config::DriftConfig;
-use crate::model::scenario::{Priority, ScenarioStatus};
+use crate::config::{DriftConfig, NotifyConfig};
+use crate::model::scenario::{CheckState, Priority, ScenarioStatus, VerifyMode};
 use crate::model::store::{
     LoadedScenario, TreeEntry, load_scenarios_tree, order_as_tree, save_updated_scenario,
 };
+use crate::notify::build_notifier;
 use crate::register::RegistrationProposal;
-use crate::watcher::drift::{DriftSummary, analyze_scenario_drift};
+use crate::watcher::drift::{
+    DriftSummary, WatchAbortRecord, analyze_scenario_drift, load_watch_abort,
+};
+use crate::watcher::update_check_manually;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -59,9 +63,12 @@ pub struct App {
     pub dir: PathBuf,
     pub state_dir: PathBuf,
     pub drift_cfg: DriftConfig,
+    pub notify_cfg: NotifyConfig,
     pub entries: Vec<TreeEntry>,
     pub drifts: HashMap<String, DriftSummary>,
+    pub aborts: HashMap<String, WatchAbortRecord>,
     pub selected: usize,
+    pub selected_check: usize,
     pub detail_scroll: u16,
     pub focus: FocusPane,
     pub modal: ModalState,
@@ -78,15 +85,28 @@ impl App {
     }
 
     pub fn load_with_state(dir: &Path, state_dir: &Path, drift_cfg: DriftConfig) -> Result<Self> {
+        Self::load_with_config(dir, state_dir, drift_cfg, NotifyConfig::default())
+    }
+
+    pub fn load_with_config(
+        dir: &Path,
+        state_dir: &Path,
+        drift_cfg: DriftConfig,
+        notify_cfg: NotifyConfig,
+    ) -> Result<Self> {
         let entries = load_scenarios_tree(dir)?;
         let drifts = load_drift_map(&entries, state_dir, &drift_cfg);
+        let aborts = load_abort_map(&entries, state_dir);
         Ok(Self {
             dir: dir.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
             drift_cfg,
+            notify_cfg,
             entries,
             drifts,
+            aborts,
             selected: 0,
+            selected_check: 0,
             detail_scroll: 0,
             focus: FocusPane::List,
             modal: ModalState::None,
@@ -102,9 +122,12 @@ impl App {
                 .join(".daihon"),
             dir,
             drift_cfg: DriftConfig::default(),
+            notify_cfg: NotifyConfig::default(),
             entries: order_as_tree(scenarios),
             drifts: HashMap::new(),
+            aborts: HashMap::new(),
             selected: 0,
+            selected_check: 0,
             detail_scroll: 0,
             focus: FocusPane::List,
             modal: ModalState::None,
@@ -124,6 +147,7 @@ impl App {
                         .map(|s| s.scenario.front_matter.id.clone())
                 });
                 self.drifts = load_drift_map(&entries, &self.state_dir, &self.drift_cfg);
+                self.aborts = load_abort_map(&entries, &self.state_dir);
                 self.entries = entries;
                 if let Some(id) = target_id
                     && let Some(pos) = self
@@ -134,6 +158,12 @@ impl App {
                     self.selected = pos;
                 } else if self.selected >= self.entries.len() {
                     self.selected = self.entries.len().saturating_sub(1);
+                }
+                let total_checks = self.total_checks_in_selected();
+                if total_checks == 0 {
+                    self.selected_check = 0;
+                } else if self.selected_check >= total_checks {
+                    self.selected_check = total_checks - 1;
                 }
                 self.detail_scroll = 0;
                 if select_id.is_none() {
@@ -196,6 +226,108 @@ impl App {
 
     pub fn drift_for(&self, scenario_id: &str) -> Option<&DriftSummary> {
         self.drifts.get(scenario_id)
+    }
+
+    pub fn abort_for(&self, scenario_id: &str) -> Option<&WatchAbortRecord> {
+        self.aborts.get(scenario_id)
+    }
+
+    pub fn total_checks_in_selected(&self) -> usize {
+        self.selected_scenario()
+            .map(|s| s.scenario.steps.iter().map(|st| st.checks.len()).sum())
+            .unwrap_or(0)
+    }
+
+    pub fn selected_check_info(&self) -> Option<(String, VerifyMode, CheckState)> {
+        let sc = &self.selected_scenario()?.scenario;
+        sc.steps
+            .iter()
+            .flat_map(|st| st.checks.iter())
+            .nth(self.selected_check)
+            .map(|c| (c.id.clone(), c.mode, c.state))
+    }
+
+    /// Switches focus directly to Detail pane and positions the check cursor on the first
+    /// `[manual]` check item (or check 0 if none exist).
+    pub fn focus_manual_checks(&mut self) {
+        if self.selected_scenario().is_none() {
+            return;
+        }
+        self.focus = FocusPane::Detail;
+        if let Some(sc) = self.selected_scenario().map(|s| &s.scenario)
+            && let Some(pos) = sc
+                .steps
+                .iter()
+                .flat_map(|st| st.checks.iter())
+                .position(|c| c.mode == VerifyMode::Manual && c.state != CheckState::Passed)
+                .or_else(|| {
+                    sc.steps
+                        .iter()
+                        .flat_map(|st| st.checks.iter())
+                        .position(|c| c.mode == VerifyMode::Manual)
+                })
+        {
+            self.selected_check = pos;
+        }
+    }
+
+    /// Toggles the currently highlighted check in Detail pane (`Passed` <-> `Pending`),
+    /// persisting surgically to Markdown and firing full-pass `ntfy` if all checks pass.
+    pub fn toggle_selected_check_passed(&mut self) {
+        let Some((_, _, current_state)) = self.selected_check_info() else {
+            return;
+        };
+        let next_state = if current_state == CheckState::Passed {
+            CheckState::Pending
+        } else {
+            CheckState::Passed
+        };
+        self.set_selected_check_state(next_state);
+    }
+
+    pub fn set_selected_check_state(&mut self, new_state: CheckState) {
+        let Some(selected) = self.selected_scenario().cloned() else {
+            return;
+        };
+        let Some((check_id, _, _)) = self.selected_check_info() else {
+            return;
+        };
+        let scenario_id = selected.scenario.front_matter.id.clone();
+        let kept_check_idx = self.selected_check;
+        let (notifier, topic) =
+            build_notifier(&self.notify_cfg, &self.state_dir, self.notify_cfg.dry_run);
+        match update_check_manually(
+            &selected.path,
+            &check_id,
+            new_state,
+            None,
+            notifier.as_ref(),
+            &topic,
+            self.notify_cfg.notify_on_ready_for_manual,
+        ) {
+            Ok((updated, notified)) => {
+                self.reload_and_select(Some(&scenario_id));
+                let max_idx = self.total_checks_in_selected().saturating_sub(1);
+                self.selected_check = kept_check_idx.min(max_idx);
+                let notify_note = if notified { " / 通知送信" } else { "" };
+                self.status_message = Some(format!(
+                    "チェック更新: {scenario_id}/{check_id} -> [{}] (全体: {}{notify_note})",
+                    new_state.marker(),
+                    updated.front_matter.status
+                ));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("チェック更新エラー: {err}"));
+            }
+        }
+    }
+
+    pub fn scroll_detail_down(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_add(3);
+    }
+
+    pub fn scroll_detail_up(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(3);
     }
 
     /// Resolves the parent scenario to attach a new Togaki to based on the current selection.
@@ -269,11 +401,17 @@ impl App {
             FocusPane::List => {
                 if !self.entries.is_empty() {
                     self.selected = (self.selected + 1) % self.entries.len();
+                    self.selected_check = 0;
                     self.detail_scroll = 0;
                 }
             }
             FocusPane::Detail => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1);
+                let total = self.total_checks_in_selected();
+                if total > 0 {
+                    self.selected_check = (self.selected_check + 1) % total;
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
             }
         }
     }
@@ -287,18 +425,40 @@ impl App {
                     } else {
                         self.selected -= 1;
                     }
+                    self.selected_check = 0;
                     self.detail_scroll = 0;
                 }
             }
             FocusPane::Detail => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                let total = self.total_checks_in_selected();
+                if total > 0 {
+                    if self.selected_check == 0 {
+                        self.selected_check = total - 1;
+                    } else {
+                        self.selected_check -= 1;
+                    }
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
             }
         }
     }
 
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
-            FocusPane::List => FocusPane::Detail,
+            FocusPane::List => {
+                // Default to first unpassed [manual] check if any when entering Detail pane.
+                if let Some(sc) = self.selected_scenario().map(|s| &s.scenario)
+                    && let Some(pos) = sc
+                        .steps
+                        .iter()
+                        .flat_map(|st| st.checks.iter())
+                        .position(|c| c.mode == VerifyMode::Manual && c.state != CheckState::Passed)
+                {
+                    self.selected_check = pos;
+                }
+                FocusPane::Detail
+            }
             FocusPane::Detail => FocusPane::List,
         };
     }
@@ -314,6 +474,17 @@ fn load_drift_map(
         let id = &entry.loaded.scenario.front_matter.id;
         if let Ok(Some(summary)) = analyze_scenario_drift(state_dir, id, drift_cfg) {
             map.insert(id.clone(), summary);
+        }
+    }
+    map
+}
+
+fn load_abort_map(entries: &[TreeEntry], state_dir: &Path) -> HashMap<String, WatchAbortRecord> {
+    let mut map = HashMap::new();
+    for entry in entries {
+        let id = &entry.loaded.scenario.front_matter.id;
+        if let Some(rec) = load_watch_abort(state_dir, id) {
+            map.insert(id.clone(), rec);
         }
     }
     map

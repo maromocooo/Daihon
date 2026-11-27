@@ -478,3 +478,84 @@ fn tui_togaki_modal_resolves_parent_and_renders_input_generating_and_preview_sta
         "Action bar missing:\n{preview_screen}"
     );
 }
+
+#[test]
+fn tui_toggles_manual_checks_in_detail_pane_and_renders_watch_abort_banner() {
+    use daihon::config::{DriftConfig, NotifyConfig};
+    use daihon::model::ScenarioStatus;
+    use daihon::tui::app::FocusPane;
+    use daihon::watcher::drift::record_watch_abort;
+
+    let dir = TempDir::new().unwrap();
+    let scenarios_dir = dir.path().join("scenarios");
+    let state_dir = dir.path().join(".daihon");
+    fs::create_dir_all(&scenarios_dir).unwrap();
+
+    let sc_path = scenarios_dir.join("01-manual-demo.md");
+    fs::write(
+        &sc_path,
+        r#"---
+id: manual-demo
+title: 実機確認デモ
+priority: P0
+status: ready_for_manual
+---
+
+## 概要
+自動テスト通過後の手動確認デモ。
+
+## ステップ
+
+### Step 1: 起動と見た目
+- status: ready_for_manual
+
+- [x] [auto] s1-c1: ビルド成功
+- [ ] [manual] s1-c2: 実機で見た目に崩れがない
+"#,
+    )
+    .unwrap();
+
+    // #9: Record a watch abort so TUI shows `[中断]` badge and banner.
+    record_watch_abort(&state_dir, "manual-demo", "codex", true, "usage limit reached").unwrap();
+
+    let notify_cfg = NotifyConfig {
+        dry_run: true,
+        topic: Some("test-topic".to_string()),
+        ..NotifyConfig::default()
+    };
+    let mut app = App::load_with_config(
+        &scenarios_dir,
+        &state_dir,
+        DriftConfig::default(),
+        notify_cfg,
+    )
+    .unwrap();
+
+    // #10: Jump directly to first unpassed [manual] check (`s1-c2`, index 1).
+    app.focus_manual_checks();
+    assert_eq!(app.focus, FocusPane::Detail);
+    assert_eq!(app.selected_check, 1);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|f| render(f, &app)).unwrap();
+    let before = buffer_to_string(&terminal);
+    assert!(before.contains("[中断]"), "一覧に [中断] バッジが出るべき:\n{before}");
+    assert!(
+        before.contains("前回の見張り実行が中断しました"),
+        "詳細に中断バナーが出るべき:\n{before}"
+    );
+    assert!(
+        before.contains("▸ [ ] [manual] s1-c2:"),
+        "選択中の manual チェックに ▸ カーソルが出るべき:\n{before}"
+    );
+
+    // Toggle selected [manual] check -> Passed -> whole scenario transitions to Passed & records dry-run notify!
+    app.toggle_selected_check_passed();
+    assert_eq!(
+        app.selected_scenario().unwrap().scenario.front_matter.status,
+        ScenarioStatus::Passed
+    );
+    let saved = fs::read_to_string(&sc_path).unwrap();
+    assert!(saved.contains("- [x] [manual] s1-c2:"));
+    assert!(state_dir.join("notifications.jsonl").exists());
+}

@@ -43,6 +43,8 @@ pub struct AgentsConfig {
     pub register: AgentKind,
     pub developer: AgentKind,
     pub watcher: AgentKind,
+    /// Optional fallback watcher agents tried automatically on rate-limit / quota / timeout errors.
+    pub watcher_fallbacks: Vec<AgentKind>,
     pub allow_same_agent: bool,
     /// Optional executable overrides (e.g. `{ claude = "/usr/local/bin/claude" }`).
     pub binaries: BTreeMap<String, String>,
@@ -56,6 +58,7 @@ impl Default for AgentsConfig {
             register: AgentKind::Agy,
             developer: AgentKind::Agy,
             watcher: AgentKind::Codex,
+            watcher_fallbacks: Vec::new(),
             allow_same_agent: false,
             binaries: BTreeMap::new(),
             extra_args: BTreeMap::new(),
@@ -127,6 +130,8 @@ impl EnvironmentConfig {
 pub struct LoopPolicyConfig {
     pub auto_start_dev: bool,
     pub max_retries: usize,
+    /// Timeout in seconds for developer agent invocations during `daihon fix` (defaults to 900s).
+    pub developer_timeout_secs: u64,
 }
 
 impl Default for LoopPolicyConfig {
@@ -134,6 +139,7 @@ impl Default for LoopPolicyConfig {
         Self {
             auto_start_dev: false,
             max_retries: 2,
+            developer_timeout_secs: 900,
         }
     }
 }
@@ -210,16 +216,27 @@ impl HarnessConfig {
     }
 
     pub fn sample_toml() -> String {
-        r#"# シナリオ駆動の開発ハーネス設定ファイル
+        Self::render_init_toml(AgentKind::Agy, AgentKind::Agy, AgentKind::Codex)
+    }
+
+    pub fn render_init_toml(
+        register: AgentKind,
+        developer: AgentKind,
+        watcher: AgentKind,
+    ) -> String {
+        format!(
+            r#"# シナリオ駆動の開発ハーネス設定ファイル
 scenarios_dir = "scenarios"
 state_dir = ".daihon"
 
 [agents]
 # 登録・開発・見張りそれぞれに使うエージェント（agy | codex | claude）
 # 既定では watcher != developer を強制します
-register = "agy"
-developer = "agy"
-watcher = "codex"
+register = "{register}"
+developer = "{developer}"
+watcher = "{watcher}"
+# 見張り役がレート制限やタイムアウトで失敗した際に自動で切り替える代替候補（開発役以外は自動適用）
+# watcher_fallbacks = ["agy"]
 allow_same_agent = false
 
 [agents.extra_args]
@@ -254,6 +271,8 @@ setup_commands = []
 # true にすると確認なしで開発役へ自動着手します（既定は毎回ユーザー承認）
 auto_start_dev = false
 max_retries = 2
+# 開発役エージェント (`daihon fix`) のタイムアウト秒数（初回ビルド等を見込んで長めに設定）
+developer_timeout_secs = 900
 
 [notify]
 provider = "ntfy"
@@ -264,6 +283,6 @@ dry_run = false
 # manual 確認項目を含むシナリオで、全 auto 項目通過時に通知するか
 notify_on_ready_for_manual = true
 "#
-        .to_string()
+        )
     }
 }

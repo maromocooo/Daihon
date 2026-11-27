@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{DEFAULT_CONFIG_FILE, HarnessConfig};
+use crate::runner::INTERNAL_RUN_ENV;
 use crate::watcher::drift::{compute_worktree_fingerprint, render_agent_context};
 
 const HOOK_START: &str = "# >>> daihon post-commit >>>";
@@ -390,6 +391,8 @@ pub fn resolve_hook_workdir(stdin_json: Option<&Value>, fallback_dir: &Path) -> 
 }
 
 /// Handles agent lifecycle hook events quickly (< 10ms) without blocking the coding agent.
+/// Skips immediately when `DAIHON_INTERNAL_RUN=1` is set so child agents spawned by Daihon
+/// (`register`, `togaki`, `watch`, `fix`) never recursively trigger background watches.
 pub fn handle_hook_event(
     event: HookEventKind,
     stdin_raw: &str,
@@ -397,6 +400,14 @@ pub fn handle_hook_event(
     current_exe: &Path,
     spawn_watch: bool,
 ) -> Result<String> {
+    if is_internal_child_run() {
+        return Ok(match event {
+            HookEventKind::AgySessionStart => "{}".to_string(),
+            HookEventKind::AgyStop => r#"{"decision":"allow"}"#.to_string(),
+            HookEventKind::ClaudeSessionStart | HookEventKind::ClaudeStop => String::new(),
+        });
+    }
+
     let stdin_json = serde_json::from_str::<Value>(stdin_raw.trim()).ok();
     let workdir = resolve_hook_workdir(stdin_json.as_ref(), fallback_dir);
 
@@ -470,6 +481,10 @@ pub fn handle_hook_event(
             Ok(String::new())
         }
     }
+}
+
+fn is_internal_child_run() -> bool {
+    std::env::var(INTERNAL_RUN_ENV).ok().as_deref() == Some("1")
 }
 
 fn maybe_trigger_hook_watch(

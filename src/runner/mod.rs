@@ -3,6 +3,10 @@ pub mod claude;
 pub mod codex;
 pub mod mock;
 
+/// Environment variable set on all child agent processes spawned by Daihon
+/// so lifecycle hooks (`agy-stop`, `claude-stop`) never recursively trigger background watches.
+pub const INTERNAL_RUN_ENV: &str = "DAIHON_INTERNAL_RUN";
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;

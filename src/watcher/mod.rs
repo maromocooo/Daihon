@@ -18,8 +18,8 @@ use crate::model::validator::validate_file;
 use crate::notify::{Notifier, build_pass_payload, should_notify};
 use crate::runner::{AgentKind, AgentRequest, AgentRunner, ExecutionMode};
 use crate::watcher::drift::{
-    DriftSummary, analyze_drift_from_reports, compute_worktree_fingerprint, load_runs_for_scenario,
-    sync_next_task_file,
+    DriftSummary, analyze_drift_from_reports, clear_watch_abort, compute_worktree_fingerprint,
+    load_runs_for_scenario, record_watch_abort, sync_next_task_file,
 };
 
 #[derive(Debug, Clone)]
@@ -137,6 +137,125 @@ pub fn resolve_distinct_watcher_agent(
     Ok(watcher)
 }
 
+/// Resolves the ordered list of watcher agent candidates: primary watcher followed by any
+/// configured `watcher_fallbacks` that stay distinct from `developer` (unless allowed).
+pub fn resolve_watcher_candidates(
+    config: &HarnessConfig,
+    override_watcher: Option<AgentKind>,
+    allow_same_agent: bool,
+) -> Result<Vec<AgentKind>> {
+    let primary = resolve_distinct_watcher_agent(config, override_watcher, allow_same_agent)?;
+    let dev = config.agents.developer;
+    let allow_same = allow_same_agent || config.agents.allow_same_agent;
+
+    let mut candidates = vec![primary];
+    for &fb in &config.agents.watcher_fallbacks {
+        if fb == AgentKind::Mock || candidates.contains(&fb) {
+            continue;
+        }
+        if fb == dev && !allow_same {
+            continue;
+        }
+        candidates.push(fb);
+    }
+    Ok(candidates)
+}
+
+/// Returns true when a watcher execution error indicates quota/rate-limit, timeout, or runner
+/// unavailability where retrying with a fallback distinct watcher agent is appropriate.
+pub fn is_fallback_worthy_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    [
+        "rate limit",
+        "usage limit",
+        "quota",
+        "429",
+        "too many requests",
+        "deadline_exceeded",
+        "print_timeout",
+        "timed out",
+        "timeout",
+        "overloaded",
+        "capacity",
+        "の起動に失敗",
+        "not found",
+        "使用上限",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+}
+
+/// Evaluates a scenario trying `watcher_runners` in priority order, automatically failing over
+/// to the next distinct watcher on rate-limit/quota/timeout errors, and recording an abort
+/// marker if all watchers fail so `status` and `tui` never silently display stale results.
+pub fn watch_scenario_with_fallbacks(
+    scenario_path: &Path,
+    watcher_runners: &[&dyn AgentRunner],
+    notifier: &dyn Notifier,
+    options: &WatchOptions,
+) -> Result<WatchRunReport> {
+    if watcher_runners.is_empty() {
+        bail!("見張り役エージェントが 1 つも指定されていません");
+    }
+
+    let scenario_id = validate_file(scenario_path)
+        .map(|s| s.front_matter.id)
+        .unwrap_or_else(|_| {
+            scenario_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
+
+    let mut last_err: Option<(String, anyhow::Error)> = None;
+    for (idx, runner) in watcher_runners.iter().enumerate() {
+        if idx > 0 {
+            println!(
+                "  -> フォールバック見張り役 ({}) へ自動切替して再試行します...",
+                runner.name()
+            );
+        }
+        match watch_scenario(scenario_path, *runner, notifier, options) {
+            Ok(report) => {
+                clear_watch_abort(&options.state_dir, &report.scenario_id);
+                return Ok(report);
+            }
+            Err(err) => {
+                let fallback_worthy = is_fallback_worthy_error(&err);
+                let has_next = idx + 1 < watcher_runners.len();
+                if fallback_worthy && has_next {
+                    eprintln!(
+                        "  ⚠ 見張り役 ({}) が中断しました（次候補へフォールバック）: {}",
+                        runner.name(),
+                        err.to_string().lines().next().unwrap_or("")
+                    );
+                    last_err = Some((runner.name().to_string(), err));
+                    continue;
+                }
+                let _ = record_watch_abort(
+                    &options.state_dir,
+                    &scenario_id,
+                    runner.name(),
+                    fallback_worthy,
+                    &format!("{err:#}"),
+                );
+                return Err(err);
+            }
+        }
+    }
+
+    let (agent, err) = last_err.expect("at least one runner attempted");
+    let _ = record_watch_abort(
+        &options.state_dir,
+        &scenario_id,
+        &agent,
+        true,
+        &format!("{err:#}"),
+    );
+    Err(err)
+}
+
 pub fn step_eval_json_schema() -> Value {
     json!({
         "type": "object",
@@ -186,6 +305,8 @@ pub fn watch_scenario(
     let started_at = Local::now().to_rfc3339();
     let run_id = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let previous_status = scenario.front_matter.status;
+    let prev_passing_cmds =
+        collect_previous_passing_commands(&options.state_dir, &scenario.front_matter.id);
 
     let mut step_results = Vec::new();
     let mut stopped_step = None;
@@ -238,6 +359,7 @@ pub fn watch_scenario(
             &step_snapshot,
             &options.environment,
             options.parent_context.as_ref(),
+            &prev_passing_cmds,
         );
         let response = watcher_runner.run(&AgentRequest {
             working_dir: options.working_dir.clone(),
@@ -417,6 +539,7 @@ pub fn watch_scenario(
 
     let saved_report_path = persist_run_report(&options.state_dir, &report)?;
     report.report_path = saved_report_path;
+    clear_watch_abort(&options.state_dir, &report.scenario_id);
 
     if let Some(scenarios_dir) = scenario_path.parent() {
         let _ = sync_next_task_file(scenarios_dir, &options.state_dir, &options.drift);
@@ -538,17 +661,53 @@ fn persist_run_report(state_dir: &Path, report: &WatchRunReport) -> Result<PathB
     Ok(path)
 }
 
+/// Collects the most recent passing `command_run` per check ID from historical watch reports
+/// so subsequent watch runs reuse proven, deterministic verification commands.
+fn collect_previous_passing_commands(
+    state_dir: &Path,
+    scenario_id: &str,
+) -> HashMap<String, String> {
+    let mut cmds = HashMap::new();
+    let Ok(history) = load_runs_for_scenario(state_dir, scenario_id) else {
+        return cmds;
+    };
+    for rep in history.iter().rev() {
+        for step in &rep.step_results {
+            for chk in &step.checks {
+                if chk.state == CheckState::Passed
+                    && !cmds.contains_key(&chk.check_id)
+                    && let Some(ref cmd) = chk.command_run
+                    && !cmd.trim().is_empty()
+                {
+                    cmds.insert(chk.check_id.clone(), cmd.trim().to_string());
+                }
+            }
+        }
+    }
+    cmds
+}
+
 fn build_watcher_step_prompt(
     scenario: &Scenario,
     step: &Step,
     env_cfg: &EnvironmentConfig,
     parent_ctx: Option<&ParentContext>,
+    prev_passing_cmds: &HashMap<String, String>,
 ) -> String {
     let auto_list = step
         .checks
         .iter()
         .filter(|c| c.mode == VerifyMode::Auto)
-        .map(|c| format!("- `{}`: {}", c.id, c.description))
+        .map(|c| {
+            if let Some(prev_cmd) = prev_passing_cmds.get(&c.id) {
+                format!(
+                    "- `{}`: {}\n  - 前回通過時の検証コマンド（参考・再現性向上用）: `{prev_cmd}`",
+                    c.id, c.description
+                )
+            } else {
+                format!("- `{}`: {}", c.id, c.description)
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -615,8 +774,9 @@ fn build_watcher_step_prompt(
 厳守事項:
 1. プロダクトのソースコード・設定ファイル・シナリオ Markdown ファイル自体は絶対に編集しないこと。
 2. 検証対象コマンドの実行に伴う一時的なランタイム状態（例: セッション状態ファイルや一時出力）の作成は許可される。前のステップで作られた状態があればそのまま利用して検証すること。
-3. 推測で passed: true にしないこと。実際にコマンドを実行して確認した根拠を `command_run` と `evidence` に書くこと。
+3. 推測で passed: true にしないこと。実際にコマンドを実行して確認した根拠を `command_run` と `evidence` に書くこと。前回通過時の検証コマンドが提示されている場合は、同じ手順を優先して再現性高く検証すること。
 4. 失敗した項目には、何が足りずどう失敗したかを `reason` に具体的に書くこと。
+5. サンドボックス環境内では macOS ネイティブ GUI (.app) 等の直接起動が OS 制約（LaunchServices / Seatbelt 等）で失敗する場合がある。その場合は「検証環境の前提」の環境メモに従い、ビルド・ヘッドレス起動・自動テストで `[auto]` 項目を検証すること（実機 GUI の見た目・操作感は `[manual]` の責務）。
 
 ## 検証対象の{role_target}
 - ID: {}
